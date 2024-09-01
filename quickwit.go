@@ -20,22 +20,27 @@ const (
 type Client struct {
 	*http.Client
 
-	Endpoint  string // http://{host}/api/v1/{index_name}
-	Auth      func(req *http.Request)
+	auth      func(req *http.Request)
 	BatchSize int
 	MaxDelay  time.Duration
 
+	endpoint     string // http://{host}/api/v1/{index_name}
 	ingestBuffer chan any
 	onceSetup    sync.Once
 }
 
-func NewClient(ingestBufferSize int) *Client {
+func NewClient(endpoint string, ingestBufferSize int) *Client {
 	if ingestBufferSize <= 0 {
 		ingestBufferSize = IngestBufferSize
 	}
 	return &Client{
+		endpoint:     endpoint,
 		ingestBuffer: make(chan any, ingestBufferSize),
 	}
+}
+
+func (c *Client) SetAuth(auth func(req *http.Request)) {
+	c.auth = auth
 }
 
 func (c *Client) httpClient() *http.Client {
@@ -59,9 +64,9 @@ func (c *Client) batchSize() int {
 	return c.BatchSize
 }
 
-func (c *Client) auth(req *http.Request) {
-	if c.Auth != nil {
-		c.Auth(req)
+func (c *Client) doAuth(req *http.Request) {
+	if c.auth != nil {
+		c.auth(req)
 	}
 }
 
@@ -91,7 +96,7 @@ func (c *Client) loop() {
 	batchSize := c.batchSize()
 	buffer := make([]any, 0, batchSize)
 
-	endpoint := c.Endpoint
+	endpoint := c.endpoint
 	endpoint = strings.TrimSuffix(endpoint, "/")
 	endpoint = endpoint + "/ingest"
 
@@ -107,7 +112,7 @@ func (c *Client) loop() {
 			panic(err)
 			return
 		}
-		c.auth(req)
+		c.doAuth(req)
 
 		for _, x := range buffer {
 			jsonEnc.Encode(x)
