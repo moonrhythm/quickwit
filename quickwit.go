@@ -12,30 +12,26 @@ import (
 )
 
 const (
-	IngestBufferSize = 1000
+	IngestBufferSize = 10000
 	IngestBatchSize  = 1000
 	IngestMaxDelay   = time.Second
 )
 
 type Client struct {
-	*http.Client
-
-	auth      func(req *http.Request)
-	BatchSize int
-	MaxDelay  time.Duration
-
-	endpoint     string // http://{host}/api/v1/{index_name}
-	ingestBuffer chan any
-	onceSetup    sync.Once
+	client           *http.Client
+	auth             func(req *http.Request)
+	endpoint         string // http://{host}/api/v1/{index_name}
+	batchSize        int
+	maxDelay         time.Duration
+	ingestBufferSize int
+	discard          bool
+	ingestBuffer     chan any
+	onceSetup        sync.Once
 }
 
-func NewClient(endpoint string, ingestBufferSize int) *Client {
-	if ingestBufferSize <= 0 {
-		ingestBufferSize = IngestBufferSize
-	}
+func NewClient(endpoint string) *Client {
 	return &Client{
-		endpoint:     endpoint,
-		ingestBuffer: make(chan any, ingestBufferSize),
+		endpoint: endpoint,
 	}
 }
 
@@ -43,25 +39,45 @@ func (c *Client) SetAuth(auth func(req *http.Request)) {
 	c.auth = auth
 }
 
+func (c *Client) SetHTTPClient(client *http.Client) {
+	c.client = client
+}
+
+func (c *Client) SetBatchSize(batchSize int) {
+	c.batchSize = batchSize
+}
+
+func (c *Client) SetMaxDelay(maxDelay time.Duration) {
+	c.maxDelay = maxDelay
+}
+
+func (c *Client) SetIngestBufferSize(size int) {
+	c.ingestBufferSize = size
+}
+
+func (c *Client) SetDiscard(discard bool) {
+	c.discard = discard
+}
+
 func (c *Client) httpClient() *http.Client {
-	if c.Client == nil {
+	if c.client == nil {
 		return http.DefaultClient
 	}
-	return c.Client
+	return c.client
 }
 
-func (c *Client) maxDelay() time.Duration {
-	if c.MaxDelay <= 0 {
+func (c *Client) getMaxDelay() time.Duration {
+	if c.maxDelay <= 0 {
 		return IngestMaxDelay
 	}
-	return c.MaxDelay
+	return c.maxDelay
 }
 
-func (c *Client) batchSize() int {
-	if c.BatchSize <= 0 {
+func (c *Client) getBatchSize() int {
+	if c.batchSize <= 0 {
 		return IngestBatchSize
 	}
-	return c.BatchSize
+	return c.batchSize
 }
 
 func (c *Client) doAuth(req *http.Request) {
@@ -75,9 +91,16 @@ func (c *Client) doAuth(req *http.Request) {
 // The data will be buffered until the buffer is full, then sent to the server.
 // If the buffer is full, Ingest will block until the buffer is no longer full.
 func (c *Client) Ingest(data ...any) {
-	c.onceSetup.Do(c.setupLoop)
+	c.onceSetup.Do(c.setup)
 	for _, x := range data {
-		c.ingestBuffer <- x
+		if c.discard {
+			select {
+			case c.ingestBuffer <- x:
+			default:
+			}
+		} else {
+			c.ingestBuffer <- x
+		}
 	}
 }
 
@@ -85,7 +108,11 @@ func (c *Client) Close() {
 	close(c.ingestBuffer)
 }
 
-func (c *Client) setupLoop() {
+func (c *Client) setup() {
+	if c.ingestBufferSize <= 0 {
+		c.ingestBufferSize = IngestBufferSize
+	}
+	c.ingestBuffer = make(chan any, c.ingestBufferSize)
 	go c.loop()
 }
 
@@ -93,7 +120,7 @@ func (c *Client) loop() {
 	var buf bytes.Buffer
 	jsonEnc := json.NewEncoder(&buf)
 
-	batchSize := c.batchSize()
+	batchSize := c.getBatchSize()
 	buffer := make([]any, 0, batchSize)
 
 	endpoint := c.endpoint
@@ -134,7 +161,7 @@ func (c *Client) loop() {
 		buffer = buffer[:0]
 	}
 
-	ticker := time.NewTicker(c.maxDelay())
+	ticker := time.NewTicker(c.getMaxDelay())
 
 	go func() {
 		for {
