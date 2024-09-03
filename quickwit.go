@@ -134,17 +134,17 @@ func (c *Client) loop() {
 
 		buf.Reset()
 
-		req, err := http.NewRequest(http.MethodPost, endpoint, &buf)
+		for _, x := range buffer {
+			jsonEnc.Encode(x)
+			buf.WriteString("\n")
+		}
+
+		req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(buf.Bytes()))
 		if err != nil {
 			panic(err)
 			return
 		}
 		c.doAuth(req)
-
-		for _, x := range buffer {
-			jsonEnc.Encode(x)
-			buf.WriteString("\n")
-		}
 
 		resp, err := c.httpClient().Do(req)
 		if err != nil {
