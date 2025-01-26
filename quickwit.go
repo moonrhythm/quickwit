@@ -15,6 +15,7 @@ const (
 	IngestBufferSize = 10000
 	IngestBatchSize  = 1000
 	IngestMaxDelay   = time.Second
+	IngestConcurrent = 2
 )
 
 type Client struct {
@@ -25,8 +26,10 @@ type Client struct {
 	maxDelay         time.Duration
 	ingestBufferSize int
 	discard          bool
+	concurrent       int
 	ingestBuffer     chan any
 	onceSetup        sync.Once
+	stopWg           sync.WaitGroup
 }
 
 func NewClient(endpoint string) *Client {
@@ -59,6 +62,10 @@ func (c *Client) SetDiscard(discard bool) {
 	c.discard = discard
 }
 
+func (c *Client) SetConcurrent(concurrent int) {
+	c.concurrent = concurrent
+}
+
 func (c *Client) httpClient() *http.Client {
 	if c.client == nil {
 		return http.DefaultClient
@@ -78,6 +85,13 @@ func (c *Client) getBatchSize() int {
 		return IngestBatchSize
 	}
 	return c.batchSize
+}
+
+func (c *Client) getConcurrent() int {
+	if c.concurrent <= 0 {
+		return IngestConcurrent
+	}
+	return c.concurrent
 }
 
 func (c *Client) doAuth(req *http.Request) {
@@ -106,6 +120,7 @@ func (c *Client) Ingest(data ...any) {
 
 func (c *Client) Close() {
 	close(c.ingestBuffer)
+	c.stopWg.Wait()
 }
 
 func (c *Client) setup() {
@@ -113,10 +128,16 @@ func (c *Client) setup() {
 		c.ingestBufferSize = IngestBufferSize
 	}
 	c.ingestBuffer = make(chan any, c.ingestBufferSize)
-	go c.loop()
+
+	for range c.getConcurrent() {
+		go c.loop()
+	}
 }
 
 func (c *Client) loop() {
+	c.stopWg.Add(1)
+	defer c.stopWg.Done()
+
 	var buf bytes.Buffer
 	jsonEnc := json.NewEncoder(&buf)
 
