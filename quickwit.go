@@ -18,6 +18,8 @@ const (
 	IngestConcurrent = 2
 )
 
+type OnDiscardFunc func(any)
+
 type Client struct {
 	client           *http.Client
 	auth             func(req *http.Request)
@@ -30,6 +32,7 @@ type Client struct {
 	ingestBuffer     chan any
 	onceSetup        sync.Once
 	stopWg           sync.WaitGroup
+	onDiscard        OnDiscardFunc
 }
 
 func NewClient(endpoint string) *Client {
@@ -66,6 +69,10 @@ func (c *Client) SetConcurrent(concurrent int) {
 	c.concurrent = concurrent
 }
 
+func (c *Client) OnDiscard(f OnDiscardFunc) {
+	c.onDiscard = f
+}
+
 func (c *Client) httpClient() *http.Client {
 	if c.client == nil {
 		return http.DefaultClient
@@ -100,6 +107,12 @@ func (c *Client) doAuth(req *http.Request) {
 	}
 }
 
+func (c *Client) invokeOnDiscard(data any) {
+	if c.onDiscard != nil {
+		c.onDiscard(data)
+	}
+}
+
 // Ingest sends data to the quickwit server.
 // The data can be any type, and will be marshalled to JSON.
 // The data will be buffered until the buffer is full, then sent to the server.
@@ -111,6 +124,7 @@ func (c *Client) Ingest(data ...any) {
 			select {
 			case c.ingestBuffer <- x:
 			default:
+				c.invokeOnDiscard(x)
 			}
 		} else {
 			c.ingestBuffer <- x
@@ -148,9 +162,9 @@ func (c *Client) loop() {
 	endpoint = strings.TrimSuffix(endpoint, "/")
 	endpoint = endpoint + "/ingest"
 
-	flush := func() {
+	flush := func() bool {
 		if len(buffer) == 0 {
-			return
+			return true
 		}
 
 		buf.Reset()
@@ -162,24 +176,24 @@ func (c *Client) loop() {
 
 		req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(buf.Bytes()))
 		if err != nil {
-			panic(err)
-			return
+			return false
 		}
 		c.doAuth(req)
 
 		resp, err := c.httpClient().Do(req)
 		if err != nil {
-			return
+			return false
 		}
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
 			slog.Error("quickwit: ingest status not ok", "status", resp.Status)
-			return
+			return false
 		}
 
 		buffer = buffer[:0]
+		return true
 	}
 
 	ticker := time.NewTicker(c.getMaxDelay())
@@ -191,7 +205,12 @@ func (c *Client) loop() {
 				flush()
 			case x, ok := <-c.ingestBuffer:
 				if !ok { // channel closed
-					flush()
+					if !flush() {
+						slog.Error("quickwit: flush failed while closing")
+						for _, x := range buffer {
+							c.invokeOnDiscard(x)
+						}
+					}
 					return
 				}
 				buffer = append(buffer, x)
