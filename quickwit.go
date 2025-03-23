@@ -2,7 +2,9 @@ package quickwit
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -220,4 +222,95 @@ func (c *Client) loop() {
 			}
 		}
 	}()
+}
+
+type SearchOpt struct {
+	StartTimestamp int64
+	EndTimestamp   int64
+	StartOffset    int64
+	MaxHits        int64
+	SearchField    []string
+	SnippetFields  []string
+	SortBy         []string
+	Format         string
+}
+
+type SearchResult struct {
+	Hits              json.RawMessage
+	NumHits           int64
+	ElapsedTimeMicros int64
+}
+
+type searchRequestQueryString struct {
+	Query          string   `json:"query"`
+	StartTimestamp *int64   `json:"start_timestamp,omitempty"`
+	EndTimestamp   *int64   `json:"end_timestamp,omitempty"`
+	StartOffset    *int64   `json:"start_offset,omitempty"`
+	MaxHits        *int64   `json:"max_hits,omitempty"`
+	SearchField    []string `json:"search_field,omitempty"`
+	SnippetFields  []string `json:"snippet_fields,omitempty"`
+	SortBy         []string `json:"sort_by,omitempty"`
+	Format         *string  `json:"format,omitempty"`
+}
+
+type searchResponseRest struct {
+	Hits              json.RawMessage `json:"hits"`
+	NumHits           int64           `json:"num_hits"`
+	ElapsedTimeMicros int64           `json:"elapsed_time_micros"`
+}
+
+func (c *Client) Search(ctx context.Context, query string, opt *SearchOpt) (*SearchResult, error) {
+	params := searchRequestQueryString{
+		Query:  query,
+		Format: Ptr("json"),
+	}
+	if opt != nil {
+		params.StartTimestamp = &opt.StartTimestamp
+		params.EndTimestamp = &opt.EndTimestamp
+		params.StartOffset = &opt.StartOffset
+		params.MaxHits = &opt.MaxHits
+		params.SearchField = opt.SearchField
+		params.SnippetFields = opt.SnippetFields
+		params.SortBy = opt.SortBy
+		params.Format = &opt.Format
+	}
+
+	reqBody, err := json.Marshal(params)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint+"/search", bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	c.doAuth(req)
+
+	resp, err := c.httpClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer io.Copy(io.Discard, resp.Body)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("quickwit: search status not ok, code: %d", resp.StatusCode)
+	}
+
+	var res searchResponseRest
+	err = json.NewDecoder(resp.Body).Decode(&res)
+	if err != nil {
+		return nil, err
+	}
+
+	return &SearchResult{
+		Hits:              res.Hits,
+		NumHits:           res.NumHits,
+		ElapsedTimeMicros: res.ElapsedTimeMicros,
+	}, nil
+}
+
+func Ptr[T any](t T) *T {
+	return &t
 }
