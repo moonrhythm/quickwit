@@ -14,27 +14,31 @@ import (
 )
 
 const (
-	IngestBufferSize = 10000
-	IngestBatchSize  = 1000
-	IngestMaxDelay   = time.Second
-	IngestConcurrent = 2
+	IngestBufferSize       = 10000
+	IngestBatchSize        = 1000
+	IngestMaxDelay         = time.Second
+	IngestConcurrent       = 2
+	ReduceBatchSizeToRatio = 0.9 // reduce 10% of the batch size
+	ReduceBatchSizeMin     = 0.1 // do not reduce below 10% of the default batch size
+	ResetBatchSizeAfter    = 10 * time.Minute
 )
 
 type OnDiscardFunc func(any)
 
 type Client struct {
-	client           *http.Client
-	auth             func(req *http.Request)
-	endpoint         string // http://{host}/api/v1/{index_name}
-	batchSize        int
-	maxDelay         time.Duration
-	ingestBufferSize int
-	discard          bool
-	concurrent       int
-	ingestBuffer     chan any
-	onceSetup        sync.Once
-	stopWg           sync.WaitGroup
-	onDiscard        OnDiscardFunc
+	client              *http.Client
+	auth                func(req *http.Request)
+	endpoint            string // http://{host}/api/v1/{index_name}
+	batchSize           int
+	maxDelay            time.Duration
+	ingestBufferSize    int
+	discard             bool
+	concurrent          int
+	ingestBuffer        chan any
+	onceSetup           sync.Once
+	stopWg              sync.WaitGroup
+	onDiscard           OnDiscardFunc
+	autoReduceBatchSize bool
 }
 
 func NewClient(endpoint string) *Client {
@@ -69,6 +73,10 @@ func (c *Client) SetDiscard(discard bool) {
 
 func (c *Client) SetConcurrent(concurrent int) {
 	c.concurrent = concurrent
+}
+
+func (c *Client) SetAutoReduceBatchSize(autoReduceBatchSize bool) {
+	c.autoReduceBatchSize = autoReduceBatchSize
 }
 
 func (c *Client) OnDiscard(f OnDiscardFunc) {
@@ -159,6 +167,7 @@ func (c *Client) loop() {
 
 	batchSize := c.getBatchSize()
 	buffer := make([]any, 0, batchSize)
+	var resetBatchSizeAfter time.Time
 
 	endpoint := c.endpoint
 	endpoint = strings.TrimSuffix(endpoint, "/")
@@ -191,10 +200,39 @@ func (c *Client) loop() {
 
 		if resp.StatusCode != http.StatusOK {
 			slog.Error("quickwit: ingest status not ok", "status", resp.Status)
+
+			if resp.StatusCode == http.StatusRequestEntityTooLarge {
+				if c.autoReduceBatchSize {
+					beforeSize := batchSize
+					batchSize = int(float64(batchSize) * ReduceBatchSizeToRatio)
+					defaultSize := c.getBatchSize()
+					minimumSize := int(float64(defaultSize) * ReduceBatchSizeMin)
+					if batchSize < minimumSize {
+						batchSize = minimumSize
+					}
+					resetBatchSizeAfter = time.Now().Add(ResetBatchSizeAfter)
+					slog.Info("quickwit: auto reduce batch size",
+						"new", batchSize,
+						"old", beforeSize,
+						"default", defaultSize,
+						"minimum", minimumSize,
+						"resetAfter", resetBatchSizeAfter.Format(time.RFC3339),
+					)
+				}
+			}
+
 			return false
 		}
 
 		buffer = buffer[:0]
+
+		if !resetBatchSizeAfter.IsZero() && time.Now().After(resetBatchSizeAfter) {
+			beforeSize := batchSize
+			batchSize = c.getBatchSize()
+			resetBatchSizeAfter = time.Time{}
+			slog.Info("quickwit: reset batch size", "batchSize", batchSize, "old", beforeSize)
+		}
+
 		return true
 	}
 
