@@ -19,7 +19,7 @@ const (
 	IngestMaxDelay         = time.Second
 	IngestConcurrent       = 2
 	ReduceBatchSizeToRatio = 0.9 // reduce 10% of the batch size
-	ReduceBatchSizeMin     = 0.1 // do not reduce more than 90% of the batch size
+	ReduceBatchSizeMin     = 0.1 // do not reduce below 10% of the default batch size
 )
 
 type OnDiscardFunc func(any)
