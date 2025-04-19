@@ -20,6 +20,7 @@ const (
 	IngestConcurrent       = 2
 	ReduceBatchSizeToRatio = 0.9 // reduce 10% of the batch size
 	ReduceBatchSizeMin     = 0.1 // do not reduce below 10% of the default batch size
+	ResetBatchSizeAfter    = 10 * time.Minute
 )
 
 type OnDiscardFunc func(any)
@@ -166,6 +167,7 @@ func (c *Client) loop() {
 
 	batchSize := c.getBatchSize()
 	buffer := make([]any, 0, batchSize)
+	var resetBatchSizeAfter time.Time
 
 	endpoint := c.endpoint
 	endpoint = strings.TrimSuffix(endpoint, "/")
@@ -208,11 +210,13 @@ func (c *Client) loop() {
 					if batchSize < minimumSize {
 						batchSize = minimumSize
 					}
+					resetBatchSizeAfter = time.Now().Add(ResetBatchSizeAfter)
 					slog.Info("quickwit: auto reduce batch size",
 						"new", batchSize,
 						"old", beforeSize,
 						"default", defaultSize,
 						"minimum", minimumSize,
+						"resetAfter", resetBatchSizeAfter.Format(time.RFC3339),
 					)
 				}
 			}
@@ -221,6 +225,14 @@ func (c *Client) loop() {
 		}
 
 		buffer = buffer[:0]
+
+		if !resetBatchSizeAfter.IsZero() && time.Now().After(resetBatchSizeAfter) {
+			beforeSize := batchSize
+			batchSize = c.getBatchSize()
+			resetBatchSizeAfter = time.Time{}
+			slog.Info("quickwit: reset batch size", "batchSize", batchSize, "old", beforeSize)
+		}
+
 		return true
 	}
 
