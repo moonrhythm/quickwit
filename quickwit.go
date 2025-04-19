@@ -14,27 +14,30 @@ import (
 )
 
 const (
-	IngestBufferSize = 10000
-	IngestBatchSize  = 1000
-	IngestMaxDelay   = time.Second
-	IngestConcurrent = 2
+	IngestBufferSize       = 10000
+	IngestBatchSize        = 1000
+	IngestMaxDelay         = time.Second
+	IngestConcurrent       = 2
+	ReduceBatchSizeToRatio = 0.9 // reduce 10% of the batch size
+	ReduceBatchSizeMin     = 0.1 // do not reduce more than 90% of the batch size
 )
 
 type OnDiscardFunc func(any)
 
 type Client struct {
-	client           *http.Client
-	auth             func(req *http.Request)
-	endpoint         string // http://{host}/api/v1/{index_name}
-	batchSize        int
-	maxDelay         time.Duration
-	ingestBufferSize int
-	discard          bool
-	concurrent       int
-	ingestBuffer     chan any
-	onceSetup        sync.Once
-	stopWg           sync.WaitGroup
-	onDiscard        OnDiscardFunc
+	client              *http.Client
+	auth                func(req *http.Request)
+	endpoint            string // http://{host}/api/v1/{index_name}
+	batchSize           int
+	maxDelay            time.Duration
+	ingestBufferSize    int
+	discard             bool
+	concurrent          int
+	ingestBuffer        chan any
+	onceSetup           sync.Once
+	stopWg              sync.WaitGroup
+	onDiscard           OnDiscardFunc
+	autoReduceBatchSize bool
 }
 
 func NewClient(endpoint string) *Client {
@@ -69,6 +72,10 @@ func (c *Client) SetDiscard(discard bool) {
 
 func (c *Client) SetConcurrent(concurrent int) {
 	c.concurrent = concurrent
+}
+
+func (c *Client) SetAutoReduceBatchSize(autoReduceBatchSize bool) {
+	c.autoReduceBatchSize = autoReduceBatchSize
 }
 
 func (c *Client) OnDiscard(f OnDiscardFunc) {
@@ -191,6 +198,25 @@ func (c *Client) loop() {
 
 		if resp.StatusCode != http.StatusOK {
 			slog.Error("quickwit: ingest status not ok", "status", resp.Status)
+
+			if resp.StatusCode == http.StatusRequestEntityTooLarge {
+				if c.autoReduceBatchSize {
+					beforeSize := batchSize
+					batchSize = int(float64(batchSize) * ReduceBatchSizeToRatio)
+					defaultSize := c.getBatchSize()
+					minimumSize := int(float64(defaultSize) * ReduceBatchSizeMin)
+					if batchSize < minimumSize {
+						batchSize = minimumSize
+					}
+					slog.Info("quickwit: auto reduce batch size",
+						"new", batchSize,
+						"old", beforeSize,
+						"default", defaultSize,
+						"minimum", minimumSize,
+					)
+				}
+			}
+
 			return false
 		}
 
