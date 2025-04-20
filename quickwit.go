@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -176,7 +177,7 @@ func (c *Client) loop() {
 	endpoint = strings.TrimSuffix(endpoint, "/")
 	endpoint = endpoint + "/ingest"
 
-	flush := func() bool {
+	flush := func(buffer []any) bool {
 		if len(buffer) == 0 {
 			return true
 		}
@@ -227,8 +228,6 @@ func (c *Client) loop() {
 			return false
 		}
 
-		buffer = buffer[:0]
-
 		if !resetBatchSizeAfter.IsZero() && time.Now().After(resetBatchSizeAfter) {
 			beforeSize := batchSize
 			batchSize = c.getBatchSize()
@@ -239,7 +238,32 @@ func (c *Client) loop() {
 		return true
 	}
 
-	ticker := time.NewTicker(c.getMaxDelay())
+	// flushOversize when buffer is oversize (from auto batch resize)
+	// split buffer into smaller parts then flush each part separately
+	flushOversize := func() bool {
+		if len(buffer) == 0 {
+			return true
+		}
+
+		if len(buffer) <= batchSize {
+			flush(buffer)
+			buffer = buffer[:0]
+			return true
+		}
+
+		parts := slices.Collect(slices.Chunk(buffer, batchSize))
+		slices.Reverse(parts)
+		var processed int
+
+		for _, chunk := range parts {
+			if flush(chunk) {
+				processed += len(chunk)
+			}
+		}
+
+		buffer = buffer[:len(buffer)-processed]
+		return true
+	}
 
 	// retryFlush attempts to flush the buffer with retries
 	// isClosing indicates if this is a final flush during shutdown
@@ -257,7 +281,7 @@ func (c *Client) loop() {
 					goto closing
 				}
 
-				if flush() {
+				if flushOversize() {
 					return true
 				}
 
@@ -279,7 +303,7 @@ func (c *Client) loop() {
 		backoff := 100 * time.Millisecond
 
 		for i := 0; i < maxRetries; i++ {
-			if flush() {
+			if flushOversize() {
 				return true
 			}
 
@@ -298,28 +322,29 @@ func (c *Client) loop() {
 		return false
 	}
 
-	go func() {
-		for {
-			select {
-			case <-ticker.C:
-				flush()
-			case x, ok := <-c.ingestBuffer:
-				if !ok { // channel closed
-					if !retryFlush(true) {
-						slog.Error("quickwit: flush failed while closing")
-						for _, x := range buffer {
-							c.invokeOnDiscard(x)
-						}
+	ticker := time.NewTicker(c.getMaxDelay())
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			flushOversize()
+		case x, ok := <-c.ingestBuffer:
+			if !ok { // channel closed
+				if !retryFlush(true) {
+					slog.Error("quickwit: flush failed while closing")
+					for _, x := range buffer {
+						c.invokeOnDiscard(x)
 					}
-					return
 				}
-				buffer = append(buffer, x)
-				if len(buffer) >= batchSize {
-					retryFlush(false)
-				}
+				return
+			}
+			buffer = append(buffer, x)
+			if len(buffer) >= batchSize {
+				retryFlush(false)
 			}
 		}
-	}()
+	}
 }
 
 type SearchOpt struct {
