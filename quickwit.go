@@ -256,13 +256,14 @@ func (c *Client) loop() {
 		var processed int
 
 		for _, chunk := range parts {
-			if flush(chunk) {
-				processed += len(chunk)
+			if !flush(chunk) {
+				break
 			}
+			processed += len(chunk)
 		}
 
 		buffer = buffer[:len(buffer)-processed]
-		return true
+		return len(buffer) == 0
 	}
 
 	// retryFlush attempts to flush the buffer with retries
