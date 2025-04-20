@@ -37,13 +37,15 @@ type Client struct {
 	ingestBuffer        chan any
 	onceSetup           sync.Once
 	stopWg              sync.WaitGroup
+	closeSignal         chan struct{}
 	onDiscard           OnDiscardFunc
 	autoReduceBatchSize bool
 }
 
 func NewClient(endpoint string) *Client {
 	return &Client{
-		endpoint: endpoint,
+		endpoint:    endpoint,
+		closeSignal: make(chan struct{}),
 	}
 }
 
@@ -143,6 +145,7 @@ func (c *Client) Ingest(data ...any) {
 }
 
 func (c *Client) Close() {
+	close(c.closeSignal)
 	close(c.ingestBuffer)
 	c.stopWg.Wait()
 }
@@ -238,6 +241,63 @@ func (c *Client) loop() {
 
 	ticker := time.NewTicker(c.getMaxDelay())
 
+	// retryFlush attempts to flush the buffer with retries
+	// isClosing indicates if this is a final flush during shutdown
+	retryFlush := func(isClosing bool) bool {
+		// If not closing, retry indefinitely until success
+		if !isClosing {
+			attempt := 0
+			backoff := 100 * time.Millisecond
+
+			for {
+				// close signal during retry
+				select {
+				default:
+				case <-c.closeSignal:
+					goto closing
+				}
+
+				if flush() {
+					return true
+				}
+
+				attempt++
+				slog.Info("quickwit: flush failed, retrying indefinitely", "attempt", attempt)
+				time.Sleep(backoff)
+				// Exponential backoff with a cap
+				backoff = time.Duration(float64(backoff) * 1.5)
+				if backoff > time.Second {
+					backoff = time.Second
+				}
+			}
+		}
+
+	closing:
+
+		// For closing case, use limited retries
+		maxRetries := 5
+		backoff := 100 * time.Millisecond
+
+		for i := 0; i < maxRetries; i++ {
+			if flush() {
+				return true
+			}
+
+			// Don't sleep on the last attempt
+			if i < maxRetries-1 {
+				slog.Info("quickwit: flush failed while closing, retrying", "attempt", i+1, "maxRetries", maxRetries)
+				time.Sleep(backoff)
+				// Exponential backoff with a cap
+				backoff = time.Duration(float64(backoff) * 1.5)
+				if backoff > time.Second {
+					backoff = time.Second
+				}
+			}
+		}
+
+		return false
+	}
+
 	go func() {
 		for {
 			select {
@@ -245,7 +305,7 @@ func (c *Client) loop() {
 				flush()
 			case x, ok := <-c.ingestBuffer:
 				if !ok { // channel closed
-					if !flush() {
+					if !retryFlush(true) {
 						slog.Error("quickwit: flush failed while closing")
 						for _, x := range buffer {
 							c.invokeOnDiscard(x)
@@ -255,7 +315,7 @@ func (c *Client) loop() {
 				}
 				buffer = append(buffer, x)
 				if len(buffer) >= batchSize {
-					flush()
+					retryFlush(false)
 				}
 			}
 		}
