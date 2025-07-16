@@ -355,7 +355,7 @@ type SearchOpt struct {
 	MaxHits        int64
 	SearchField    []string
 	SnippetFields  []string
-	SortBy         []string
+	SortBy         string
 	Format         string
 }
 
@@ -373,7 +373,7 @@ type searchRequestQueryString struct {
 	MaxHits        *int64   `json:"max_hits,omitempty"`
 	SearchField    []string `json:"search_field,omitempty"`
 	SnippetFields  []string `json:"snippet_fields,omitempty"`
-	SortBy         []string `json:"sort_by,omitempty"`
+	SortBy         string   `json:"sort_by,omitempty"`
 	Format         *string  `json:"format,omitempty"`
 }
 
