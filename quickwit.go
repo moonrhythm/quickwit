@@ -19,6 +19,7 @@ const (
 	IngestBatchSize        = 1000
 	IngestMaxDelay         = time.Second
 	IngestConcurrent       = 2
+	IngestTimeout          = 15 * time.Second
 	ReduceBatchSizeToRatio = 0.9 // reduce 10% of the batch size
 	ReduceBatchSizeMin     = 0.1 // do not reduce below 10% of the default batch size
 	ResetBatchSizeAfter    = 10 * time.Minute
@@ -33,6 +34,7 @@ type Client struct {
 	batchSize           int
 	maxDelay            time.Duration
 	ingestBufferSize    int
+	ingestTimeout       time.Duration
 	discard             bool
 	concurrent          int
 	ingestBuffer        chan any
@@ -68,6 +70,10 @@ func (c *Client) SetMaxDelay(maxDelay time.Duration) {
 
 func (c *Client) SetIngestBufferSize(size int) {
 	c.ingestBufferSize = size
+}
+
+func (c *Client) SetIngestTimeout(timeout time.Duration) {
+	c.ingestTimeout = timeout
 }
 
 func (c *Client) SetDiscard(discard bool) {
@@ -112,6 +118,13 @@ func (c *Client) getConcurrent() int {
 		return IngestConcurrent
 	}
 	return c.concurrent
+}
+
+func (c *Client) getIngestTimeout() time.Duration {
+	if c.ingestTimeout <= 0 {
+		return IngestTimeout
+	}
+	return c.ingestTimeout
 }
 
 func (c *Client) doAuth(req *http.Request) {
@@ -189,7 +202,13 @@ func (c *Client) loop() {
 			buf.WriteString("\n")
 		}
 
-		req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(buf.Bytes()))
+		ctx := context.Background()
+		if t := c.getIngestTimeout(); t != 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, t)
+			defer cancel()
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(buf.Bytes()))
 		if err != nil {
 			return false
 		}
