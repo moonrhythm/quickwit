@@ -265,7 +265,9 @@ func (c *Client) loop() {
 		}
 
 		if len(buffer) <= batchSize {
-			flush(buffer)
+			if !flush(buffer) {
+				return false
+			}
 			buffer = buffer[:0]
 			return true
 		}
