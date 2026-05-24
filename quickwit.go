@@ -408,14 +408,24 @@ func (c *Client) Search(ctx context.Context, query string, opt *SearchOpt) (*Sea
 		Format: Ptr("json"),
 	}
 	if opt != nil {
-		params.StartTimestamp = &opt.StartTimestamp
-		params.EndTimestamp = &opt.EndTimestamp
-		params.StartOffset = &opt.StartOffset
-		params.MaxHits = &opt.MaxHits
+		if opt.StartTimestamp != 0 {
+			params.StartTimestamp = &opt.StartTimestamp
+		}
+		if opt.EndTimestamp != 0 {
+			params.EndTimestamp = &opt.EndTimestamp
+		}
+		if opt.StartOffset != 0 {
+			params.StartOffset = &opt.StartOffset
+		}
+		if opt.MaxHits != 0 {
+			params.MaxHits = &opt.MaxHits
+		}
 		params.SearchField = opt.SearchField
 		params.SnippetFields = opt.SnippetFields
 		params.SortBy = opt.SortBy
-		params.Format = &opt.Format
+		if opt.Format != "" {
+			params.Format = &opt.Format
+		}
 	}
 
 	reqBody, err := json.Marshal(params)
