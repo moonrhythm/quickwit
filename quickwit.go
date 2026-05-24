@@ -170,13 +170,14 @@ func (c *Client) setup() {
 	}
 	c.ingestBuffer = make(chan any, c.ingestBufferSize)
 
-	for range c.getConcurrent() {
+	concurrent := c.getConcurrent()
+	c.stopWg.Add(concurrent)
+	for range concurrent {
 		go c.loop()
 	}
 }
 
 func (c *Client) loop() {
-	c.stopWg.Add(1)
 	defer c.stopWg.Done()
 
 	var buf bytes.Buffer
