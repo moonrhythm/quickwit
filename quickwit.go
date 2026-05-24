@@ -199,7 +199,6 @@ func (c *Client) loop() {
 
 		for _, x := range buffer {
 			jsonEnc.Encode(x)
-			buf.WriteString("\n")
 		}
 
 		ctx := context.Background()
