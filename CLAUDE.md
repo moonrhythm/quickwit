@@ -26,6 +26,7 @@ Key behaviors:
 - **Retries**: failed flushes retry with exponential backoff indefinitely during normal operation; `Close()` retries up to 5 times then discards.
 - **Setup is lazy**: the background goroutines start on the first `Ingest` call via `sync.Once`.
 - **`Close()`** is idempotent and safe to call before the first `Ingest`.
+- **Gzip**: off by default; `SetGzip(true)` compresses each batch and sends `Content-Encoding: gzip` (the endpoint must accept gzip-encoded ingest).
 
 ### Search (sync)
 

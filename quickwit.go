@@ -2,6 +2,7 @@ package quickwit
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -46,6 +47,7 @@ type Client struct {
 	closeSignal         chan struct{}
 	onDiscard           OnDiscardFunc
 	autoReduceBatchSize bool
+	gzipEnabled         bool
 }
 
 func NewClient(endpoint string) *Client {
@@ -89,6 +91,13 @@ func (c *Client) SetConcurrent(concurrent int) {
 
 func (c *Client) SetAutoReduceBatchSize(autoReduceBatchSize bool) {
 	c.autoReduceBatchSize = autoReduceBatchSize
+}
+
+// SetGzip enables gzip compression of the ingest request body. When enabled,
+// each batch is compressed and sent with a Content-Encoding: gzip header.
+// The Quickwit endpoint must accept gzip-encoded ingest requests.
+func (c *Client) SetGzip(enabled bool) {
+	c.gzipEnabled = enabled
 }
 
 func (c *Client) OnDiscard(f OnDiscardFunc) {
@@ -212,6 +221,15 @@ func (c *Client) loop() {
 	var buf bytes.Buffer
 	jsonEnc := json.NewEncoder(&buf)
 
+	// gzip state is per-worker and reused across flushes via Reset to avoid
+	// reallocating the compressor on every batch.
+	useGzip := c.gzipEnabled
+	var gzBuf bytes.Buffer
+	var gzw *gzip.Writer
+	if useGzip {
+		gzw = gzip.NewWriter(&gzBuf)
+	}
+
 	batchSize := c.getBatchSize()
 	buffer := make([]any, 0, batchSize)
 	var resetBatchSizeAfter time.Time
@@ -245,15 +263,35 @@ func (c *Client) loop() {
 			return true
 		}
 
+		// body holds the NDJSON payload, gzip-compressed when enabled. Writing
+		// to a bytes.Buffer cannot fail, so gzw errors are not expected here.
+		body := buf.Bytes()
+		if useGzip {
+			gzBuf.Reset()
+			gzw.Reset(&gzBuf)
+			if _, err := gzw.Write(buf.Bytes()); err != nil {
+				slog.Error("quickwit: failed to gzip ingest body", "error", err)
+				return false
+			}
+			if err := gzw.Close(); err != nil {
+				slog.Error("quickwit: failed to finalize gzip ingest body", "error", err)
+				return false
+			}
+			body = gzBuf.Bytes()
+		}
+
 		ctx := context.Background()
 		cancel := context.CancelFunc(func() {})
 		if t := c.getIngestTimeout(); t != 0 {
 			ctx, cancel = context.WithTimeout(ctx, t)
 		}
 		defer cancel()
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(buf.Bytes()))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if err != nil {
 			return false
+		}
+		if useGzip {
+			req.Header.Set("Content-Encoding", "gzip")
 		}
 		c.doAuth(req)
 
