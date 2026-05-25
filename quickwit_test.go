@@ -124,6 +124,83 @@ func TestIngest_JSONEncodeError_CallsOnDiscard(t *testing.T) {
 	}
 }
 
+// Regression #11: unencodable items caused OnDiscard to fire on every retry when the HTTP
+// request also failed — the callback must fire exactly once per item.
+func TestIngest_EncodeError_DiscardedExactlyOnce_OnHTTPFailure(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts < 3 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	var mu sync.Mutex
+	var discarded []any
+
+	c := quickwit.NewClient(server.URL + "/api/v1/test")
+	c.SetConcurrent(1)
+	c.OnDiscard(func(data any) {
+		mu.Lock()
+		discarded = append(discarded, data)
+		mu.Unlock()
+	})
+
+	ch := make(chan int) // not JSON-encodable
+	c.Ingest(map[string]any{"ok": true}, ch)
+	c.Close()
+
+	mu.Lock()
+	n := len(discarded)
+	mu.Unlock()
+
+	if n != 1 {
+		t.Errorf("OnDiscard called %d times, want exactly 1 (got %d HTTP attempts)", n, attempts)
+	}
+}
+
+// Regression #12: when all items in a batch fail to encode, flush sent an empty HTTP body.
+// If the server rejects an empty body, retryFlush looped indefinitely re-discarding items.
+func TestIngest_AllEncodeErrors_NoHTTPRequest(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		w.WriteHeader(http.StatusBadRequest) // server rejects empty body
+	}))
+	defer server.Close()
+
+	var mu sync.Mutex
+	var discarded []any
+
+	c := quickwit.NewClient(server.URL + "/api/v1/test")
+	c.SetConcurrent(1)
+	c.OnDiscard(func(data any) {
+		mu.Lock()
+		discarded = append(discarded, data)
+		mu.Unlock()
+	})
+
+	ch1 := make(chan int)
+	ch2 := make(chan int)
+	c.Ingest(ch1, ch2)
+	c.Close()
+
+	mu.Lock()
+	n := len(discarded)
+	mu.Unlock()
+
+	if requestCount != 0 {
+		t.Errorf("expected no HTTP requests when all items are unencodable, got %d", requestCount)
+	}
+	if n != 2 {
+		t.Errorf("OnDiscard called %d times, want 2", n)
+	}
+}
+
 // Regression #10: when a 413 triggered batch-size reduction, re-flushing the oversized
 // buffer in smaller chunks silently reversed or lost the tail of the record sequence.
 func TestIngest_OversizeBatchPreservesOrder(t *testing.T) {

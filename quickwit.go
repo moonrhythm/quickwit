@@ -202,12 +202,22 @@ func (c *Client) loop() {
 
 		buf.Reset()
 
+		var encodeFailures []any
 		for _, x := range buffer {
 			if err := jsonEnc.Encode(x); err != nil {
 				slog.Error("quickwit: failed to encode record, discarding", "error", err)
-				c.invokeOnDiscard(x)
+				encodeFailures = append(encodeFailures, x)
 				continue
 			}
+		}
+
+		// All items were unencodable — discard them and report success so the
+		// caller clears the buffer and does not retry with the same items.
+		if buf.Len() == 0 {
+			for _, x := range encodeFailures {
+				c.invokeOnDiscard(x)
+			}
+			return true
 		}
 
 		ctx := context.Background()
@@ -253,6 +263,11 @@ func (c *Client) loop() {
 			}
 
 			return false
+		}
+
+		// HTTP succeeded — now safe to discard items that failed encoding.
+		for _, x := range encodeFailures {
+			c.invokeOnDiscard(x)
 		}
 
 		if !resetBatchSizeAfter.IsZero() && time.Now().After(resetBatchSizeAfter) {
