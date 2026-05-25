@@ -39,6 +39,7 @@ type Client struct {
 	concurrent          int
 	ingestBuffer        chan any
 	onceSetup           sync.Once
+	onceClose           sync.Once
 	stopWg              sync.WaitGroup
 	closeSignal         chan struct{}
 	onDiscard           OnDiscardFunc
@@ -159,8 +160,11 @@ func (c *Client) Ingest(data ...any) {
 }
 
 func (c *Client) Close() {
-	close(c.closeSignal)
-	close(c.ingestBuffer)
+	c.onceSetup.Do(c.setup)
+	c.onceClose.Do(func() {
+		close(c.closeSignal)
+		close(c.ingestBuffer)
+	})
 	c.stopWg.Wait()
 }
 
