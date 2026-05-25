@@ -211,11 +211,11 @@ func (c *Client) loop() {
 		}
 
 		ctx := context.Background()
+		cancel := context.CancelFunc(func() {})
 		if t := c.getIngestTimeout(); t != 0 {
-			var cancel context.CancelFunc
 			ctx, cancel = context.WithTimeout(ctx, t)
-			defer cancel()
 		}
+		defer cancel()
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(buf.Bytes()))
 		if err != nil {
 			return false
