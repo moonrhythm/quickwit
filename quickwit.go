@@ -462,7 +462,7 @@ func (c *Client) Search(ctx context.Context, query string, opt *SearchOpt) (*Sea
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint+"/search", bytes.NewReader(reqBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimSuffix(c.endpoint, "/")+"/search", bytes.NewReader(reqBody))
 	if err != nil {
 		return nil, err
 	}
