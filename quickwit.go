@@ -280,18 +280,22 @@ func (c *Client) loop() {
 			return true
 		}
 
-		parts := slices.Collect(slices.Chunk(buffer, batchSize))
-		slices.Reverse(parts)
 		var processed int
 
-		for _, chunk := range parts {
+		for chunk := range slices.Chunk(buffer, batchSize) {
 			if !flush(chunk) {
 				break
 			}
 			processed += len(chunk)
 		}
 
-		buffer = buffer[:len(buffer)-processed]
+		// drop the flushed prefix, keeping unprocessed records in their
+		// original order at the front of the buffer, and clear the now
+		// unused tail so flushed records can be garbage collected
+		oldLen := len(buffer)
+		remaining := copy(buffer, buffer[processed:])
+		clear(buffer[remaining:oldLen])
+		buffer = buffer[:remaining]
 		return len(buffer) == 0
 	}
 
