@@ -1,6 +1,7 @@
 package quickwit_test
 
 import (
+	"compress/gzip"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -237,6 +238,64 @@ func TestIngest_AppliesAuthHook(t *testing.T) {
 	defer mu.Unlock()
 	if gotAuth != "Bearer test-token" {
 		t.Errorf("Authorization header = %q, want %q", gotAuth, "Bearer test-token")
+	}
+}
+
+// Core: with gzip enabled, the request carries Content-Encoding: gzip and the
+// decompressed body still delivers every record in order.
+func TestIngest_GzipCompressesBody(t *testing.T) {
+	const numItems = 250
+
+	var mu sync.Mutex
+	var received []int
+	sawGzip := true // require every request to be gzip-encoded
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Content-Encoding") != "gzip" {
+			mu.Lock()
+			sawGzip = false
+			mu.Unlock()
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		gr, err := gzip.NewReader(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		body, _ := io.ReadAll(gr)
+		gr.Close()
+
+		mu.Lock()
+		received = append(received, parseIndices(body)...)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	c := quickwit.NewClient(server.URL + "/api/v1/test")
+	c.SetConcurrent(1)
+	c.SetBatchSize(50)
+	c.SetGzip(true)
+
+	for i := 0; i < numItems; i++ {
+		c.Ingest(map[string]any{"index": i})
+	}
+	c.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if !sawGzip {
+		t.Fatal("a request arrived without Content-Encoding: gzip")
+	}
+	if len(received) != numItems {
+		t.Fatalf("received %d items, want %d", len(received), numItems)
+	}
+	for i, idx := range received {
+		if idx != i {
+			t.Errorf("position %d: got index %d, want %d", i, idx, i)
+		}
 	}
 }
 
