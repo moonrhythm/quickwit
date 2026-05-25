@@ -199,7 +199,11 @@ func (c *Client) loop() {
 		buf.Reset()
 
 		for _, x := range buffer {
-			jsonEnc.Encode(x)
+			if err := jsonEnc.Encode(x); err != nil {
+				slog.Error("quickwit: failed to encode record, discarding", "error", err)
+				c.invokeOnDiscard(x)
+				continue
+			}
 		}
 
 		ctx := context.Background()
