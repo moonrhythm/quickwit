@@ -38,6 +38,8 @@ type Client struct {
 	discard             bool
 	concurrent          int
 	ingestBuffer        chan any
+	defaultClient       *http.Client
+	onceDefaultClient   sync.Once
 	onceSetup           sync.Once
 	onceClose           sync.Once
 	stopWg              sync.WaitGroup
@@ -94,10 +96,33 @@ func (c *Client) OnDiscard(f OnDiscardFunc) {
 }
 
 func (c *Client) httpClient() *http.Client {
-	if c.client == nil {
-		return http.DefaultClient
+	if c.client != nil {
+		return c.client
 	}
-	return c.client
+	// When no client is supplied, fall back to a tuned default instead of
+	// http.DefaultClient. Its transport's MaxIdleConnsPerHost defaults to 2,
+	// which would close (and force a fresh handshake on) every connection
+	// beyond the first two when SetConcurrent raises the worker count. Sizing
+	// the idle pool to the worker count lets each worker keep its connection
+	// hot for reuse. Built once, lazily, so the pool is shared across workers.
+	c.onceDefaultClient.Do(func() {
+		c.defaultClient = c.newDefaultClient()
+	})
+	return c.defaultClient
+}
+
+func (c *Client) newDefaultClient() *http.Client {
+	concurrent := c.getConcurrent()
+
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.MaxIdleConnsPerHost = concurrent
+	if t.MaxIdleConns < concurrent {
+		t.MaxIdleConns = concurrent
+	}
+
+	// No client-level timeout: the per-request context deadline from
+	// getIngestTimeout already bounds each flush, matching prior behavior.
+	return &http.Client{Transport: t}
 }
 
 func (c *Client) getMaxDelay() time.Duration {
