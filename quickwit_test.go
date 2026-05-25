@@ -2,6 +2,7 @@ package quickwit_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -177,5 +178,30 @@ func TestIngest_OversizeBatchPreservesOrder(t *testing.T) {
 		if idx != i {
 			t.Errorf("position %d: got index %d, want %d", i, idx, i)
 		}
+	}
+}
+
+// Regression: Search did not strip a trailing slash from the endpoint before appending
+// "/search", producing a double-slash URL that many servers/proxies reject.
+func TestSearch_TrailingSlashEndpoint(t *testing.T) {
+	var capturedPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"hits":[],"num_hits":0,"elapsed_time_micros":1}`))
+	}))
+	defer server.Close()
+
+	// Intentionally add trailing slash to endpoint
+	c := quickwit.NewClient(server.URL + "/api/v1/test/")
+	ctx := context.Background()
+	c.Search(ctx, "*", nil)
+
+	if strings.Contains(capturedPath, "//") {
+		t.Errorf("Search URL contains double slash: %s", capturedPath)
+	}
+	if !strings.HasSuffix(capturedPath, "/search") {
+		t.Errorf("Search URL does not end with /search: %s", capturedPath)
 	}
 }
