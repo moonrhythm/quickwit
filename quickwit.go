@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -40,6 +41,7 @@ type Client struct {
 	ingestBuffer        chan any
 	onceSetup           sync.Once
 	onceClose           sync.Once
+	setupDone           atomic.Bool
 	stopWg              sync.WaitGroup
 	closeSignal         chan struct{}
 	onDiscard           OnDiscardFunc
@@ -160,7 +162,9 @@ func (c *Client) Ingest(data ...any) {
 }
 
 func (c *Client) Close() {
-	c.onceSetup.Do(c.setup)
+	if !c.setupDone.Load() {
+		return
+	}
 	c.onceClose.Do(func() {
 		close(c.closeSignal)
 		close(c.ingestBuffer)
@@ -177,6 +181,8 @@ func (c *Client) setup() {
 	for range c.getConcurrent() {
 		go c.loop()
 	}
+
+	c.setupDone.Store(true)
 }
 
 func (c *Client) loop() {
