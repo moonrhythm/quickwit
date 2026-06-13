@@ -44,6 +44,12 @@ const (
 	// ReasonClosed: the client was closed before the item could be accepted.
 	// Transient; Nack so another instance handles it.
 	ReasonClosed
+	// ReasonServer: the server permanently rejected the batch with a 4xx that
+	// retrying cannot fix (e.g. 400/422 bad document, 401/403 auth, 404 wrong
+	// index, 409 conflict). Inspect the cause: a bad document should be
+	// dead-lettered and Acked; a misconfiguration must be fixed (Nacking would
+	// redeliver forever). 5xx and 413 are not this — they stay retryable.
+	ReasonServer
 )
 
 func (r DiscardReason) String() string {
@@ -54,8 +60,28 @@ func (r DiscardReason) String() string {
 		return "buffer_full"
 	case ReasonClosed:
 		return "closed"
+	case ReasonServer:
+		return "server"
 	default:
 		return "unknown"
+	}
+}
+
+// permanentIngestStatus reports whether an HTTP status from the ingest endpoint
+// is a permanent rejection that retrying the same batch cannot fix. 5xx, 408,
+// 425, 429 and 413 are deliberately excluded — they stay retryable (413 has its
+// own auto-reduce path).
+func permanentIngestStatus(code int) bool {
+	switch code {
+	case http.StatusBadRequest, // 400
+		http.StatusUnauthorized,        // 401
+		http.StatusForbidden,           // 403
+		http.StatusNotFound,            // 404
+		http.StatusConflict,            // 409
+		http.StatusUnprocessableEntity: // 422
+		return true
+	default:
+		return false
 	}
 }
 
@@ -534,15 +560,15 @@ func (c *Client) loop() {
 
 		buf.Reset()
 
-		// encoded holds the items written into the body, to settle on HTTP 200.
 		// encodeFailures can only ever hold fire-and-forget items (ack == nil):
 		// tracked items carry a pre-encoded raw line, so they cannot fail here.
-		encoded := make([]ingestItem, 0, len(batch))
+		// On HTTP 200 we settle the whole batch directly — settle(nil) is a no-op
+		// for the ack==nil encode failures — so no separate "encoded" slice is
+		// allocated per flush.
 		var encodeFailures []ingestItem
 		for _, it := range batch {
 			if it.raw != nil {
 				buf.Write(it.raw)
-				encoded = append(encoded, it)
 				continue
 			}
 			if err := jsonEnc.Encode(it.data); err != nil {
@@ -550,7 +576,6 @@ func (c *Client) loop() {
 				encodeFailures = append(encodeFailures, it)
 				continue
 			}
-			encoded = append(encoded, it)
 		}
 
 		// All items were unencodable — discard them and report success so the
@@ -622,26 +647,36 @@ func (c *Client) loop() {
 						"resetAfter", resetBatchSizeAfter.Format(time.RFC3339),
 					)
 				}
+				return false
 			}
 
+			// Permanent rejection: retrying the same batch cannot succeed, so
+			// settle/discard it and report it handled. Otherwise the worker would
+			// loop forever in retryFlush and, with the default 2 workers, a couple
+			// of poison batches would freeze all ingest.
+			if permanentIngestStatus(resp.StatusCode) {
+				err := &IngestError{
+					Reason: ReasonServer,
+					Err:    fmt.Errorf("quickwit: ingest rejected with status %s", resp.Status),
+				}
+				for _, it := range batch {
+					c.discardItem(it, err)
+				}
+				return true
+			}
+
+			// Retryable (5xx, 408, 425, 429, transport errors handled above).
 			return false
 		}
 
-		// HTTP 200 is the only durable-acceptance point: settle every tracked
-		// item that made it into the body (no-op for fire-and-forget items),
-		// then discard items that failed encoding.
-		for _, it := range encoded {
+		// HTTP 200 is the only durable-acceptance point: settle every item in the
+		// batch (settle is a no-op for fire-and-forget and encode-failure items,
+		// which have ack == nil), then discard items that failed encoding.
+		for _, it := range batch {
 			it.ack.settle(nil)
 		}
 		for _, it := range encodeFailures {
 			c.invokeOnDiscard(it.data)
-		}
-
-		if !resetBatchSizeAfter.IsZero() && time.Now().After(resetBatchSizeAfter) {
-			beforeSize := batchSize
-			batchSize = c.getBatchSize()
-			resetBatchSizeAfter = time.Time{}
-			slog.Info("quickwit: reset batch size", "batchSize", batchSize, "old", beforeSize)
 		}
 
 		return true
@@ -749,6 +784,20 @@ func (c *Client) loop() {
 		}
 	}
 
+	// maybeResetBatchSize restores the batch size once the post-413 reduction
+	// window has elapsed. It is driven by the ticker rather than the flush
+	// success path so it fires even when traffic goes quiet — an idle buffer
+	// never calls flush, so a success-only reset could leave the batch
+	// permanently shrunk after a transient 413 spike.
+	maybeResetBatchSize := func() {
+		if !resetBatchSizeAfter.IsZero() && time.Now().After(resetBatchSizeAfter) {
+			beforeSize := batchSize
+			batchSize = c.getBatchSize()
+			resetBatchSizeAfter = time.Time{}
+			slog.Info("quickwit: reset batch size", "batchSize", batchSize, "old", beforeSize)
+		}
+	}
+
 	ticker := time.NewTicker(c.getMaxDelay())
 	defer ticker.Stop()
 
@@ -763,6 +812,7 @@ func (c *Client) loop() {
 	for {
 		select {
 		case <-ticker.C:
+			maybeResetBatchSize()
 			flushOversize()
 			if len(buffer) == 0 {
 				hasTracked = false
