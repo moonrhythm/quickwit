@@ -28,6 +28,133 @@ const (
 
 type OnDiscardFunc func(any)
 
+// DiscardReason explains why a tracked ingest item (one submitted via IngestSync
+// or IngestBatch) was dropped before the server durably accepted it. It is
+// carried by *IngestError so a caller — e.g. a pub/sub handler — can decide
+// between Ack-and-dead-letter and Nack-and-redeliver.
+type DiscardReason int
+
+const (
+	// ReasonEncode: the value could not be JSON-encoded. Retrying never helps;
+	// the item is poison. Dead-letter and Ack.
+	ReasonEncode DiscardReason = iota
+	// ReasonBufferFull: discard mode is on (SetDiscard) and the buffer was full.
+	// Transient; Nack to redeliver.
+	ReasonBufferFull
+	// ReasonClosed: the client was closed before the item could be accepted.
+	// Transient; Nack so another instance handles it.
+	ReasonClosed
+)
+
+func (r DiscardReason) String() string {
+	switch r {
+	case ReasonEncode:
+		return "encode"
+	case ReasonBufferFull:
+		return "buffer_full"
+	case ReasonClosed:
+		return "closed"
+	default:
+		return "unknown"
+	}
+}
+
+// IngestError is returned by IngestSync and IngestReceipt.Wait when an item was
+// dropped by the client before the server durably accepted it. A wrapped
+// context error (not an *IngestError) instead means "not confirmed": the item
+// may still be ingested. Use errors.As to inspect Reason.
+type IngestError struct {
+	Reason DiscardReason
+	Err    error // underlying cause, if any (e.g. the json encode error)
+}
+
+func (e *IngestError) Error() string {
+	if e.Err != nil {
+		return "quickwit: ingest discarded (" + e.Reason.String() + "): " + e.Err.Error()
+	}
+	return "quickwit: ingest discarded (" + e.Reason.String() + ")"
+}
+
+func (e *IngestError) Unwrap() error { return e.Err }
+
+// ingestItem is one record flowing through the buffer. data is the original
+// value (used by OnDiscard and for fire-and-forget worker-side encoding). raw,
+// when non-nil, is the pre-encoded NDJSON line — set by the tracked IngestSync/
+// IngestBatch path so the worker never re-encodes it and encode errors surface
+// synchronously to the caller. ack is nil for fire-and-forget Ingest, so every
+// settle site is a no-op and the hot path stays allocation-free.
+type ingestItem struct {
+	data any
+	raw  []byte
+	ack  *ackBatch
+}
+
+// ackBatch is the shared completion handle for the N items of one IngestSync or
+// IngestBatch call. The worker settles each item exactly once — nil on HTTP 200,
+// an *IngestError on a terminal drop. done is closed on the 0-transition and the
+// first non-nil error wins. settle is concurrency-safe because, with
+// SetConcurrent > 1, sibling items of one call may be flushed by different
+// workers simultaneously.
+type ackBatch struct {
+	mu        sync.Mutex
+	remaining int
+	err       error
+	done      chan struct{}
+}
+
+func newAckBatch(n int) *ackBatch {
+	return &ackBatch{remaining: n, done: make(chan struct{})}
+}
+
+func (a *ackBatch) settle(err error) {
+	if a == nil { // fire-and-forget item: no completion handle
+		return
+	}
+	a.mu.Lock()
+	if a.remaining == 0 {
+		a.mu.Unlock()
+		return
+	}
+	if err != nil && a.err == nil {
+		a.err = err
+	}
+	a.remaining--
+	last := a.remaining == 0
+	a.mu.Unlock()
+	if last {
+		close(a.done)
+	}
+}
+
+func (a *ackBatch) wait(ctx context.Context) error {
+	select {
+	case <-a.done:
+		a.mu.Lock()
+		err := a.err
+		a.mu.Unlock()
+		return err
+	case <-ctx.Done():
+		// Ambiguous: the items are still in the worker buffer and may yet be
+		// ingested. The caller must treat this as "not confirmed" and Nack.
+		return fmt.Errorf("quickwit: ingest pending: %w", ctx.Err())
+	}
+}
+
+// IngestReceipt is the completion handle returned by IngestBatch.
+type IngestReceipt struct {
+	ack *ackBatch
+}
+
+// Wait blocks until every item in the batch is durably accepted (returns nil) or
+// terminally dropped (returns an *IngestError), or until ctx fires (returns a
+// wrapped context error meaning "not confirmed"). See IngestSync for the full
+// error contract.
+func (r *IngestReceipt) Wait(ctx context.Context) error { return r.ack.wait(ctx) }
+
+// Done is closed once every item in the batch has reached a terminal state, for
+// callers that want to select on it alongside other events.
+func (r *IngestReceipt) Done() <-chan struct{} { return r.ack.done }
+
 type Client struct {
 	client              *http.Client
 	auth                func(req *http.Request)
@@ -38,7 +165,7 @@ type Client struct {
 	ingestTimeout       time.Duration
 	discard             bool
 	concurrent          int
-	ingestBuffer        chan any
+	ingestBuffer        chan ingestItem
 	defaultClient       *http.Client
 	onceDefaultClient   sync.Once
 	onceSetup           sync.Once
@@ -48,6 +175,8 @@ type Client struct {
 	onDiscard           OnDiscardFunc
 	autoReduceBatchSize bool
 	gzipEnabled         bool
+	sendMu              sync.RWMutex // guards buffer sends against close(ingestBuffer) in Close
+	closed              bool         // set under sendMu write lock in Close
 }
 
 func NewClient(endpoint string) *Client {
@@ -174,30 +303,188 @@ func (c *Client) invokeOnDiscard(data any) {
 	}
 }
 
-// Ingest sends data to the quickwit server.
-// The data can be any type, and will be marshalled to JSON.
-// The data will be buffered until the buffer is full, then sent to the server.
-// If the buffer is full, Ingest will block until the buffer is no longer full.
+// Ingest enqueues data for asynchronous, fire-and-forget delivery. Each value is
+// JSON-encoded by a background worker and sent in batches. Ingest does not report
+// delivery: on a crash before the batch is flushed the data is lost, and after
+// Close it is dropped (via OnDiscard). When you need to know the data was durably
+// accepted — for example to Ack a pub/sub message — use IngestSync instead.
+//
+// Without SetDiscard, Ingest blocks while the buffer is full; with SetDiscard it
+// drops the item and invokes OnDiscard.
 func (c *Client) Ingest(data ...any) {
 	c.onceSetup.Do(c.setup)
+
+	c.sendMu.RLock()
+	defer c.sendMu.RUnlock()
+	if c.closed {
+		for _, x := range data {
+			c.invokeOnDiscard(x)
+		}
+		return
+	}
 	for _, x := range data {
+		it := ingestItem{data: x}
 		if c.discard {
 			select {
-			case c.ingestBuffer <- x:
+			case c.ingestBuffer <- it:
 			default:
 				c.invokeOnDiscard(x)
 			}
 		} else {
-			c.ingestBuffer <- x
+			c.ingestBuffer <- it
 		}
 	}
+}
+
+// IngestSync synchronously ingests data and reports whether the server durably
+// accepted it, so a caller can decide when to Ack an upstream message (e.g. from
+// a pub/sub subscription). It JSON-encodes every value up front — a non-encodable
+// value returns *IngestError{Reason: ReasonEncode} immediately, before anything
+// is buffered — enqueues the items, and blocks until:
+//
+//   - all items received HTTP 200 from {endpoint}/ingest → returns nil (Ack);
+//   - an item was terminally dropped → returns an *IngestError with ReasonEncode
+//     (poison: dead-letter and Ack), or ReasonBufferFull / ReasonClosed
+//     (transient: Nack to redeliver);
+//   - ctx fired first → returns a wrapped context error. This is AMBIGUOUS: the
+//     item is still buffered and may yet be ingested, so treat it as "not
+//     confirmed" and Nack.
+//
+// Delivery is at-least-once: there is an unavoidable window between the server's
+// 200 and the caller's Ack, so a crash can redeliver. Attach a deterministic
+// document id and dedup on it. Pass a ctx whose deadline sits comfortably inside
+// the subscription's ack-deadline; IngestSync never creates its own timeout. For
+// low-volume topics, lower SetMaxDelay so a lone item is not held for up to the
+// flush interval before its first POST.
+//
+// With multiple values the result is a single first-error-wins verdict for the
+// whole call; ingest one document per call for a clean message-to-verdict map.
+func (c *Client) IngestSync(ctx context.Context, data ...any) error {
+	if len(data) == 0 {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("quickwit: ingest pending: %w", err)
+	}
+
+	raws, err := encodeAll(data)
+	if err != nil {
+		return err
+	}
+
+	c.onceSetup.Do(c.setup)
+	ack := newAckBatch(len(data))
+	c.enqueueAll(ctx, data, raws, ack)
+	return ack.wait(ctx)
+}
+
+// IngestBatch enqueues data like IngestSync but returns immediately with a
+// receipt the caller can Wait on later (or select on via Done). It uses the same
+// backpressure as Ingest: without SetDiscard it blocks while the buffer is full.
+// A non-encodable value settles the whole batch with ReasonEncode without
+// buffering anything. See IngestSync for the delivery guarantee and caveats.
+func (c *Client) IngestBatch(data ...any) *IngestReceipt {
+	ack := newAckBatch(len(data))
+	if len(data) == 0 {
+		close(ack.done)
+		return &IngestReceipt{ack: ack}
+	}
+
+	raws, err := encodeAll(data)
+	if err != nil {
+		// Nothing buffered; settle every item with the encode error.
+		for range data {
+			ack.settle(err)
+		}
+		return &IngestReceipt{ack: ack}
+	}
+
+	c.onceSetup.Do(c.setup)
+	// context.Background never cancels, so enqueue blocks on a full buffer
+	// (matching Ingest) and only bails on Close.
+	c.enqueueAll(context.Background(), data, raws, ack)
+	return &IngestReceipt{ack: ack}
+}
+
+// encodeAll JSON-encodes every value into an NDJSON line (data + '\n'), failing
+// fast on the first non-encodable value so the caller learns of a poison item
+// before anything is buffered.
+func encodeAll(data []any) ([][]byte, error) {
+	raws := make([][]byte, len(data))
+	for i, x := range data {
+		raw, err := json.Marshal(x)
+		if err != nil {
+			return nil, &IngestError{Reason: ReasonEncode, Err: err}
+		}
+		raws[i] = append(raw, '\n')
+	}
+	return raws, nil
+}
+
+// enqueueAll sends every item of one tracked call, sharing ack. If a send fails
+// terminally (closed, buffer-full in discard mode, or ctx fired), it settles the
+// failing item and the not-yet-enqueued remainder with that error so wait can
+// complete; items enqueued before the failure settle later via the worker.
+func (c *Client) enqueueAll(ctx context.Context, data []any, raws [][]byte, ack *ackBatch) {
+	for i := range raws {
+		if err := c.enqueueTracked(ctx, ingestItem{data: data[i], raw: raws[i], ack: ack}); err != nil {
+			for j := i; j < len(raws); j++ {
+				ack.settle(err)
+			}
+			return
+		}
+	}
+}
+
+// enqueueTracked sends one tracked item, honoring discard mode, the caller ctx,
+// and shutdown. It never blocks past ctx, and the RLock makes the send mutually
+// exclusive with Close's channel close, so it cannot panic on a closed channel.
+func (c *Client) enqueueTracked(ctx context.Context, it ingestItem) error {
+	c.sendMu.RLock()
+	defer c.sendMu.RUnlock()
+	if c.closed {
+		return &IngestError{Reason: ReasonClosed}
+	}
+	if c.discard {
+		select {
+		case c.ingestBuffer <- it:
+			return nil
+		default:
+			return &IngestError{Reason: ReasonBufferFull}
+		}
+	}
+	select {
+	case c.ingestBuffer <- it:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("quickwit: ingest pending: %w", ctx.Err())
+	case <-c.closeSignal:
+		return &IngestError{Reason: ReasonClosed}
+	}
+}
+
+// discardItem reports a dropped item: fire-and-forget items go to OnDiscard;
+// tracked items settle their ack with err (no OnDiscard — the ack is the signal).
+func (c *Client) discardItem(it ingestItem, err error) {
+	if it.ack != nil {
+		it.ack.settle(err)
+		return
+	}
+	c.invokeOnDiscard(it.data)
 }
 
 func (c *Client) Close() {
 	c.onceSetup.Do(c.setup)
 	c.onceClose.Do(func() {
+		// Signal first so blocked tracked sends and the worker's retry loop can
+		// bail, then take the write lock — which waits for all in-flight sends to
+		// release their RLock — before closing the buffer, so no send can race the
+		// close and panic.
 		close(c.closeSignal)
+		c.sendMu.Lock()
+		c.closed = true
 		close(c.ingestBuffer)
+		c.sendMu.Unlock()
 	})
 	c.stopWg.Wait()
 }
@@ -206,7 +493,7 @@ func (c *Client) setup() {
 	if c.ingestBufferSize <= 0 {
 		c.ingestBufferSize = IngestBufferSize
 	}
-	c.ingestBuffer = make(chan any, c.ingestBufferSize)
+	c.ingestBuffer = make(chan ingestItem, c.ingestBufferSize)
 
 	concurrent := c.getConcurrent()
 	c.stopWg.Add(concurrent)
@@ -231,34 +518,44 @@ func (c *Client) loop() {
 	}
 
 	batchSize := c.getBatchSize()
-	buffer := make([]any, 0, batchSize)
+	buffer := make([]ingestItem, 0, batchSize)
 	var resetBatchSizeAfter time.Time
 
 	endpoint := c.endpoint
 	endpoint = strings.TrimSuffix(endpoint, "/")
 	endpoint = endpoint + "/ingest"
 
-	flush := func(buffer []any) bool {
-		if len(buffer) == 0 {
+	flush := func(batch []ingestItem) bool {
+		if len(batch) == 0 {
 			return true
 		}
 
 		buf.Reset()
 
-		var encodeFailures []any
-		for _, x := range buffer {
-			if err := jsonEnc.Encode(x); err != nil {
-				slog.Error("quickwit: failed to encode record, discarding", "error", err)
-				encodeFailures = append(encodeFailures, x)
+		// encoded holds the items written into the body, to settle on HTTP 200.
+		// encodeFailures can only ever hold fire-and-forget items (ack == nil):
+		// tracked items carry a pre-encoded raw line, so they cannot fail here.
+		encoded := make([]ingestItem, 0, len(batch))
+		var encodeFailures []ingestItem
+		for _, it := range batch {
+			if it.raw != nil {
+				buf.Write(it.raw)
+				encoded = append(encoded, it)
 				continue
 			}
+			if err := jsonEnc.Encode(it.data); err != nil {
+				slog.Error("quickwit: failed to encode record, discarding", "error", err)
+				encodeFailures = append(encodeFailures, it)
+				continue
+			}
+			encoded = append(encoded, it)
 		}
 
 		// All items were unencodable — discard them and report success so the
 		// caller clears the buffer and does not retry with the same items.
 		if buf.Len() == 0 {
-			for _, x := range encodeFailures {
-				c.invokeOnDiscard(x)
+			for _, it := range encodeFailures {
+				c.invokeOnDiscard(it.data)
 			}
 			return true
 		}
@@ -328,9 +625,14 @@ func (c *Client) loop() {
 			return false
 		}
 
-		// HTTP succeeded — now safe to discard items that failed encoding.
-		for _, x := range encodeFailures {
-			c.invokeOnDiscard(x)
+		// HTTP 200 is the only durable-acceptance point: settle every tracked
+		// item that made it into the body (no-op for fire-and-forget items),
+		// then discard items that failed encoding.
+		for _, it := range encoded {
+			it.ack.settle(nil)
+		}
+		for _, it := range encodeFailures {
+			c.invokeOnDiscard(it.data)
 		}
 
 		if !resetBatchSizeAfter.IsZero() && time.Now().After(resetBatchSizeAfter) {
@@ -445,8 +747,8 @@ func (c *Client) loop() {
 			if !ok { // channel closed
 				if !retryFlush(true) {
 					slog.Error("quickwit: flush failed while closing")
-					for _, x := range buffer {
-						c.invokeOnDiscard(x)
+					for _, it := range buffer {
+						c.discardItem(it, &IngestError{Reason: ReasonClosed})
 					}
 				}
 				return
