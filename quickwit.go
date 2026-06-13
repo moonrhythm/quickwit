@@ -26,9 +26,36 @@ const (
 	ReduceBatchSizeToRatio = 0.9 // reduce 10% of the batch size
 	ReduceBatchSizeMin     = 0.1 // do not reduce below 10% of the default batch size
 	ResetBatchSizeAfter    = 10 * time.Minute
+
+	// ingestResponseMaxBytes caps how much of the ingest response body is read
+	// before parsing, so a pathological body cannot exhaust memory. The default
+	// response is a few counts; only detailed_response with many parse failures
+	// approaches this.
+	ingestResponseMaxBytes = 1 << 20 // 1 MiB
 )
 
 type OnDiscardFunc func(any)
+
+// OnRejectFunc is called with the number of documents the server reported as
+// parse-rejected in a single ingest response (a 200 with num_rejected_docs > 0).
+// It is the only signal for a PARTIAL rejection, where the client cannot tell
+// which documents in a coalesced batch failed and Acks the batch anyway. When a
+// whole batch is rejected, tracked items also settle with ReasonRejected.
+type OnRejectFunc func(numRejected int)
+
+// ingestResponse is the subset of the Quickwit ingest response the client acts
+// on. Pointer fields distinguish "absent" (older servers) from zero. See
+// https://quickwit.io/docs — a 200 only means the docs were queued.
+type ingestResponse struct {
+	NumIngestedDocs *int64               `json:"num_ingested_docs"`
+	NumRejectedDocs *int64               `json:"num_rejected_docs"`
+	ParseFailures   []ingestParseFailure `json:"parse_failures"` // only with detailed_response
+}
+
+type ingestParseFailure struct {
+	Message string `json:"message"`
+	Reason  string `json:"reason"`
+}
 
 // DiscardReason explains why a tracked ingest item (one submitted via IngestSync
 // or IngestBatch) was dropped before the server durably accepted it. It is
@@ -52,6 +79,12 @@ const (
 	// dead-lettered and Acked; a misconfiguration must be fixed (Nacking would
 	// redeliver forever). 5xx and 413 are not this — they stay retryable.
 	ReasonServer
+	// ReasonRejected: the server returned 200 but its response reported that the
+	// document was parse-rejected (bad JSON or schema) and not indexed. Retrying
+	// never helps; dead-letter and Ack. Only reported when the whole flushed
+	// batch was rejected, so attribution is exact (see OnReject for the partial
+	// case).
+	ReasonRejected
 )
 
 func (r DiscardReason) String() string {
@@ -64,6 +97,8 @@ func (r DiscardReason) String() string {
 		return "closed"
 	case ReasonServer:
 		return "server"
+	case ReasonRejected:
+		return "rejected"
 	default:
 		return "unknown"
 	}
@@ -201,8 +236,10 @@ type Client struct {
 	stopWg              sync.WaitGroup
 	closeSignal         chan struct{}
 	onDiscard           OnDiscardFunc
+	onReject            OnRejectFunc
 	autoReduceBatchSize bool
 	gzipEnabled         bool
+	detailedResponse    bool
 	sendMu              sync.RWMutex // guards buffer sends against close(ingestBuffer) in Close
 	closed              bool         // set under sendMu write lock in Close
 }
@@ -259,6 +296,22 @@ func (c *Client) SetGzip(enabled bool) {
 
 func (c *Client) OnDiscard(f OnDiscardFunc) {
 	c.onDiscard = f
+}
+
+// OnReject registers a callback invoked with the number of documents the server
+// reported as parse-rejected on an otherwise-successful (200) ingest. It is the
+// hook for partial rejections that the client cannot attribute to a specific
+// document. Set before the first Ingest.
+func (c *Client) OnReject(f OnRejectFunc) {
+	c.onReject = f
+}
+
+// SetIngestDetailedResponse requests Quickwit's detailed ingest response
+// (?detailed_response=true) so per-document parse-failure reasons are logged
+// when documents are rejected. It adds response size/CPU on the server, so it is
+// off by default. Set before the first Ingest.
+func (c *Client) SetIngestDetailedResponse(enabled bool) {
+	c.detailedResponse = enabled
 }
 
 func (c *Client) httpClient() *http.Client {
@@ -377,6 +430,51 @@ func (c *Client) invokeOnDiscard(data any) {
 	}
 }
 
+func (c *Client) invokeOnReject(numRejected int) {
+	if c.onReject != nil {
+		c.onReject(numRejected)
+	}
+}
+
+// inspectIngestResponse parses a 200 ingest response and reports whether the
+// server rejected any documents and whether it rejected ALL of them. It is
+// lenient: an unparseable body or absent fields (older servers) is treated as
+// "no rejection info" so the accept-on-200 behavior is preserved. allRejected is
+// reported only when the server ingested nothing, which makes the per-item
+// ReasonRejected verdict exact (no accepted doc is dead-lettered).
+func (c *Client) inspectIngestResponse(body []byte, endpoint string) (rejected, allRejected bool) {
+	// An empty body (some proxies, older servers) carries no rejection info;
+	// accept silently rather than warn on every flush.
+	if len(bytes.TrimSpace(body)) == 0 {
+		return false, false
+	}
+	var r ingestResponse
+	if err := json.Unmarshal(body, &r); err != nil {
+		slog.Warn("quickwit: could not parse ingest response", "endpoint", endpoint, "error", err)
+		return false, false
+	}
+	if r.NumRejectedDocs == nil || *r.NumRejectedDocs <= 0 {
+		return false, false
+	}
+
+	ingested := int64(-1) // -1: server did not report it
+	if r.NumIngestedDocs != nil {
+		ingested = *r.NumIngestedDocs
+	}
+	slog.Warn("quickwit: server rejected documents",
+		"endpoint", endpoint,
+		"rejected", *r.NumRejectedDocs,
+		"ingested", ingested,
+	)
+	for _, pf := range r.ParseFailures {
+		slog.Warn("quickwit: document parse failure", "reason", pf.Reason, "message", pf.Message)
+	}
+	c.invokeOnReject(int(*r.NumRejectedDocs))
+
+	// Unambiguous only when the server ingested nothing: every doc was rejected.
+	return true, r.NumIngestedDocs != nil && *r.NumIngestedDocs == 0
+}
+
 // Ingest enqueues data for asynchronous, fire-and-forget delivery. Each value is
 // JSON-encoded by a background worker and sent in batches. Ingest does not report
 // delivery: on a crash before the batch is flushed the data is lost, and after
@@ -416,10 +514,13 @@ func (c *Client) Ingest(data ...any) {
 // value returns *IngestError{Reason: ReasonEncode} immediately, before anything
 // is buffered — enqueues the items, and blocks until:
 //
-//   - all items received HTTP 200 from {endpoint}/ingest → returns nil (Ack);
-//   - an item was terminally dropped → returns an *IngestError with ReasonEncode
-//     (poison: dead-letter and Ack), or ReasonBufferFull / ReasonClosed
-//     (transient: Nack to redeliver);
+//   - all items were durably accepted (HTTP 200 with no rejection) → returns nil
+//     (Ack);
+//   - an item was terminally dropped → returns an *IngestError whose Reason is
+//     ReasonEncode (bad document) or ReasonRejected (server parse-rejected the
+//     whole batch) — poison, dead-letter and Ack; ReasonServer (permanent 4xx —
+//     inspect, usually a misconfig to fix); or ReasonBufferFull / ReasonClosed
+//     (transient — Nack to redeliver);
 //   - ctx fired first → returns a wrapped context error. This is AMBIGUOUS: the
 //     item is still buffered and may yet be ingested, so treat it as "not
 //     confirmed" and Nack.
@@ -605,6 +706,9 @@ func (c *Client) loop() {
 	endpoint := c.endpoint
 	endpoint = strings.TrimSuffix(endpoint, "/")
 	endpoint = endpoint + "/ingest"
+	if c.detailedResponse {
+		endpoint = endpoint + "?detailed_response=true"
+	}
 
 	flush := func(batch []ingestItem) bool {
 		if len(batch) == 0 {
@@ -677,10 +781,11 @@ func (c *Client) loop() {
 		if err != nil {
 			return false
 		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+
 			slog.Error("quickwit: ingest status not ok", "status", resp.Status)
 
 			if resp.StatusCode == http.StatusRequestEntityTooLarge {
@@ -731,9 +836,36 @@ func (c *Client) loop() {
 			return false
 		}
 
-		// HTTP 200 is the only durable-acceptance point: settle every item in the
-		// batch (settle is a no-op for fire-and-forget and encode-failure items,
-		// which have ack == nil), then discard items that failed encoding.
+		// HTTP 200 only means the documents were queued. Read the response (bounded)
+		// and inspect it: the server reports how many documents it parse-rejected.
+		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, ingestResponseMaxBytes))
+		io.Copy(io.Discard, resp.Body) // drain any remainder so the connection can be reused
+		resp.Body.Close()
+		if readErr != nil {
+			// A truncated/incomplete 200 is ambiguous — retry rather than settle.
+			slog.Error("quickwit: failed to read ingest response", "error", readErr)
+			return false
+		}
+
+		// When the whole batch was parse-rejected the verdict is exact, so settle
+		// tracked items with ReasonRejected (and discard fire-and-forget) instead
+		// of falsely reporting them durable. A partial rejection cannot be
+		// attributed to specific documents in a coalesced batch — it is surfaced
+		// via OnReject inside inspectIngestResponse and the batch is still Acked.
+		if rejected, allRejected := c.inspectIngestResponse(respBody, endpoint); rejected && allRejected {
+			err := &IngestError{
+				Reason: ReasonRejected,
+				Err:    fmt.Errorf("quickwit: server rejected all %d document(s) in the batch", len(batch)),
+			}
+			for _, it := range batch {
+				c.discardItem(it, err)
+			}
+			return true
+		}
+
+		// Durably accepted: settle every item in the batch (settle is a no-op for
+		// fire-and-forget and encode-failure items, which have ack == nil), then
+		// discard items that failed encoding.
 		for _, it := range batch {
 			it.ack.settle(nil)
 		}
