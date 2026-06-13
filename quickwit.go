@@ -26,6 +26,7 @@ const (
 	ReduceBatchSizeToRatio = 0.9 // reduce 10% of the batch size
 	ReduceBatchSizeMin     = 0.1 // do not reduce below 10% of the default batch size
 	ResetBatchSizeAfter    = 10 * time.Minute
+	CloseTimeout           = 5 * time.Second // how long Close retries the final flush before discarding
 
 	// ingestResponseMaxBytes caps how much of the ingest response body is read
 	// before parsing, so a pathological body cannot exhaust memory. The default
@@ -226,6 +227,7 @@ type Client struct {
 	maxDelay            time.Duration
 	ingestBufferSize    int
 	ingestTimeout       time.Duration
+	closeTimeout        time.Duration
 	discard             bool
 	concurrent          int
 	ingestBuffer        chan ingestItem
@@ -273,6 +275,21 @@ func (c *Client) SetIngestBufferSize(size int) {
 
 func (c *Client) SetIngestTimeout(timeout time.Duration) {
 	c.ingestTimeout = timeout
+}
+
+// SetCloseTimeout bounds the retry window Close spends re-attempting the final
+// flush of buffered records before giving up and discarding them. A larger value
+// rides out a transient outage (e.g. a rolling restart); a permanent rejection
+// still exits fast. Records still undelivered when it elapses are dropped
+// (OnDiscard for fire-and-forget, settled ReasonClosed for tracked).
+//
+// It bounds the retry window, not total Close time: each attempt makes a real
+// request bounded by SetIngestTimeout, so an in-flight flush can overrun the
+// window by up to that, and a record already mid-retry when Close is called can
+// take up to roughly twice the window. Set before the first Ingest; defaults to
+// CloseTimeout.
+func (c *Client) SetCloseTimeout(timeout time.Duration) {
+	c.closeTimeout = timeout
 }
 
 func (c *Client) SetDiscard(discard bool) {
@@ -395,6 +412,13 @@ func (c *Client) getMaxDelay() time.Duration {
 		return IngestMaxDelay
 	}
 	return c.maxDelay
+}
+
+func (c *Client) getCloseTimeout() time.Duration {
+	if c.closeTimeout <= 0 {
+		return CloseTimeout
+	}
+	return c.closeTimeout
 }
 
 func (c *Client) getBatchSize() int {
@@ -650,6 +674,10 @@ func (c *Client) discardItem(it ingestItem, err error) {
 	c.invokeOnDiscard(it.data)
 }
 
+// Close stops the workers after flushing what is buffered. It blocks until the
+// final flush succeeds or the close-timeout retry window (see SetCloseTimeout)
+// elapses, after which any still-undelivered records are discarded. Close is
+// idempotent and safe to call before the first Ingest.
 func (c *Client) Close() {
 	c.onceSetup.Do(c.setup)
 	c.onceClose.Do(func() {
@@ -958,30 +986,37 @@ func (c *Client) loop() {
 
 	closing:
 
-		// For closing case, use limited retries
-		maxRetries := 5
+		// For the closing case, retry until the close-timeout deadline. A
+		// permanent rejection still exits immediately (flush reports it handled);
+		// only transient failures consume the window. Retry-After is intentionally
+		// not honored here so a server-requested delay cannot stretch shutdown.
+		deadline := time.Now().Add(c.getCloseTimeout())
 		backoff := 100 * time.Millisecond
+		attempt := 0
 
-		for i := 0; i < maxRetries; i++ {
+		for {
 			if flushOversize() {
 				return true
 			}
 
-			// Don't sleep on the last attempt
-			if i < maxRetries-1 {
-				slog.Info("quickwit: flush failed while closing, retrying", "attempt", i+1, "maxRetries", maxRetries)
-				// Jittered backoff; Retry-After is intentionally not honored here
-				// so a server-requested delay cannot stretch shutdown.
-				time.Sleep(jitterBackoff(backoff))
-				// Exponential backoff with a cap
-				backoff = time.Duration(float64(backoff) * 1.5)
-				if backoff > time.Second {
-					backoff = time.Second
-				}
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return false
+			}
+
+			attempt++
+			slog.Info("quickwit: flush failed while closing, retrying", "attempt", attempt)
+			sleep := jitterBackoff(backoff)
+			if sleep > remaining {
+				sleep = remaining // never sleep past the deadline
+			}
+			time.Sleep(sleep)
+			// Exponential backoff with a cap
+			backoff = time.Duration(float64(backoff) * 1.5)
+			if backoff > time.Second {
+				backoff = time.Second
 			}
 		}
-
-		return false
 	}
 
 	// finalFlush drains the buffer on shutdown, settling/discarding anything the
