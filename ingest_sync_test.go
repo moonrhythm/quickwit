@@ -281,12 +281,13 @@ func TestIngestBatch_ClosedWhileServerFailsSettlesClosed(t *testing.T) {
 
 	c := quickwit.NewClient(server.URL + "/api/v1/test")
 	c.SetConcurrent(1)
-	c.SetBatchSize(1000)            // never reached
-	c.SetMaxDelay(10 * time.Second) // never fires before Close
+	c.SetBatchSize(1000)                      // never reached
+	c.SetMaxDelay(10 * time.Second)           // never fires before Close
+	c.SetCloseTimeout(200 * time.Millisecond) // give up quickly for the test
 	r := c.IngestBatch(map[string]any{"index": 0})
 
-	// Close drains the buffer, fails the final flush 5×, then gives up and
-	// settles the remaining items.
+	// Close drains the buffer, retries the final flush until the close timeout,
+	// then gives up and settles the remaining items.
 	c.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
