@@ -353,9 +353,11 @@ func (c *Client) Ingest(data ...any) {
 // Delivery is at-least-once: there is an unavoidable window between the server's
 // 200 and the caller's Ack, so a crash can redeliver. Attach a deterministic
 // document id and dedup on it. Pass a ctx whose deadline sits comfortably inside
-// the subscription's ack-deadline; IngestSync never creates its own timeout. For
-// low-volume topics, lower SetMaxDelay so a lone item is not held for up to the
-// flush interval before its first POST.
+// the subscription's ack-deadline; IngestSync never creates its own timeout.
+//
+// Ack latency is bounded by the round-trip, not by maxDelay: because the items
+// are completion-tracked, the worker flushes them as soon as it goes idle rather
+// than waiting out the flush interval, while still coalescing bursts into batches.
 //
 // With multiple values the result is a single first-error-wins verdict for the
 // whole call; ingest one document per call for a clean message-to-verdict map.
@@ -736,26 +738,79 @@ func (c *Client) loop() {
 		return false
 	}
 
+	// finalFlush drains the buffer on shutdown, settling/discarding anything the
+	// server never accepted.
+	finalFlush := func() {
+		if !retryFlush(true) {
+			slog.Error("quickwit: flush failed while closing")
+			for _, it := range buffer {
+				c.discardItem(it, &IngestError{Reason: ReasonClosed})
+			}
+		}
+	}
+
 	ticker := time.NewTicker(c.getMaxDelay())
 	defer ticker.Stop()
+
+	// hasTracked is true while the buffer may hold a completion-tracked item
+	// (one submitted via IngestSync / IngestBatch). Such items are latency
+	// sensitive — the caller is blocked waiting to Ack — so once one is buffered
+	// the worker flushes as soon as the channel goes idle instead of waiting for
+	// the ticker, bounding Ack latency by the round-trip rather than by maxDelay.
+	// Pure fire-and-forget traffic never sets this, so its batching is unchanged.
+	hasTracked := false
 
 	for {
 		select {
 		case <-ticker.C:
 			flushOversize()
+			if len(buffer) == 0 {
+				hasTracked = false
+			}
 		case x, ok := <-c.ingestBuffer:
 			if !ok { // channel closed
-				if !retryFlush(true) {
-					slog.Error("quickwit: flush failed while closing")
-					for _, it := range buffer {
-						c.discardItem(it, &IngestError{Reason: ReasonClosed})
-					}
-				}
+				finalFlush()
 				return
 			}
 			buffer = append(buffer, x)
-			if len(buffer) >= batchSize {
-				retryFlush(false)
+			if x.ack != nil {
+				hasTracked = true
+			}
+
+			if !hasTracked {
+				if len(buffer) >= batchSize {
+					retryFlush(false)
+				}
+				continue
+			}
+
+			// A tracked item is waiting: greedily pull whatever else is already
+			// queued (up to a full batch) so a burst still coalesces, then flush
+			// without waiting for the ticker.
+			closed := false
+		drain:
+			for len(buffer) < batchSize {
+				select {
+				case x, ok := <-c.ingestBuffer:
+					if !ok {
+						closed = true
+						break drain
+					}
+					buffer = append(buffer, x)
+					if x.ack != nil {
+						hasTracked = true
+					}
+				default:
+					break drain
+				}
+			}
+			if closed {
+				finalFlush()
+				return
+			}
+			retryFlush(false)
+			if len(buffer) == 0 {
+				hasTracked = false
 			}
 		}
 	}

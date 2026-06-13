@@ -298,6 +298,123 @@ func TestIngestBatch_ClosedWhileServerFailsSettlesClosed(t *testing.T) {
 	}
 }
 
+// Core: a tracked item flushes as soon as the worker is idle, so IngestSync
+// returns well before maxDelay even when the batch size is never reached.
+func TestIngestSync_FlushesOnIdleBeforeMaxDelay(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	c := quickwit.NewClient(server.URL + "/api/v1/test")
+	c.SetConcurrent(1)
+	c.SetBatchSize(1000)            // size trigger never fires
+	c.SetMaxDelay(30 * time.Second) // ticker must not be what flushes it
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	err := c.IngestSync(ctx, map[string]any{"index": 0})
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("IngestSync returned %v, want nil", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("IngestSync took %v, want well under maxDelay (idle flush)", elapsed)
+	}
+}
+
+// Core: fire-and-forget Ingest is unaffected by idle flush — a partial batch
+// still waits for the timer rather than flushing immediately.
+func TestIngest_FireAndForgetDoesNotIdleFlush(t *testing.T) {
+	const maxDelay = 400 * time.Millisecond
+
+	arrived := make(chan time.Duration, 1)
+	start := time.Now()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case arrived <- time.Since(start):
+		default:
+		}
+		io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	c := quickwit.NewClient(server.URL + "/api/v1/test")
+	c.SetConcurrent(1)
+	c.SetBatchSize(1000) // never reached
+	c.SetMaxDelay(maxDelay)
+	defer c.Close()
+
+	start = time.Now()
+	c.Ingest(
+		map[string]any{"index": 0},
+		map[string]any{"index": 1},
+	)
+
+	select {
+	case d := <-arrived:
+		// Must have waited for the timer, not flushed on idle. Use a margin
+		// below maxDelay to stay robust against scheduling jitter.
+		if d < maxDelay/2 {
+			t.Errorf("fire-and-forget flush arrived after %v, want it to wait ~%v for the timer", d, maxDelay)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no request arrived before timeout")
+	}
+}
+
+// Core: even with idle flush active, a tracked burst still coalesces and every
+// record is delivered exactly once, in order.
+func TestIngestSync_IdleFlushPreservesDeliveryUnderBurst(t *testing.T) {
+	const numItems = 300
+
+	var mu sync.Mutex
+	var received []int
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		received = append(received, parseIndices(body)...)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	c := quickwit.NewClient(server.URL + "/api/v1/test")
+	c.SetConcurrent(1) // single worker => global order is observable
+	c.SetBatchSize(50)
+	c.SetMaxDelay(30 * time.Second)
+	defer c.Close()
+
+	// One call enqueues the whole burst, so the drain coalesces it into batches.
+	data := make([]any, numItems)
+	for i := range data {
+		data[i] = map[string]any{"index": i}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.IngestSync(ctx, data...); err != nil {
+		t.Fatalf("IngestSync returned %v, want nil", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(received) != numItems {
+		t.Fatalf("received %d items, want %d", len(received), numItems)
+	}
+	for i, idx := range received {
+		if idx != i {
+			t.Errorf("position %d: got index %d, want %d", i, idx, i)
+		}
+	}
+}
+
 // Core: IngestSync with no data is a no-op that returns nil even before setup.
 func TestIngestSync_EmptyIsNoop(t *testing.T) {
 	c := quickwit.NewClient("http://example/api/v1/test")
