@@ -37,6 +37,34 @@ const (
 
 type OnDiscardFunc func(any)
 
+// CommitMode selects Quickwit's ingest commit behavior (the ?commit= query
+// parameter). It controls what a 200 response means for durability/visibility.
+type CommitMode int
+
+const (
+	// CommitAuto (default): the server returns once documents are persisted to
+	// its ingest write-ahead log. Crash-safe, but not necessarily searchable yet.
+	CommitAuto CommitMode = iota
+	// CommitWaitFor: the server returns only once the documents are committed and
+	// searchable (read-your-writes). Higher latency — the request blocks until the
+	// next commit — so the ingest timeout must be large enough to cover it.
+	CommitWaitFor
+	// CommitForce: like wait_for but also forces an immediate commit. Rarely
+	// wanted; a commit per flush creates many tiny splits and hurts indexing.
+	CommitForce
+)
+
+func (m CommitMode) queryValue() string {
+	switch m {
+	case CommitWaitFor:
+		return "wait_for"
+	case CommitForce:
+		return "force"
+	default:
+		return ""
+	}
+}
+
 // OnRejectFunc is called with the number of documents the server reported as
 // parse-rejected in a single ingest response (a 200 with num_rejected_docs > 0).
 // It is the only signal for a PARTIAL rejection, where the client cannot tell
@@ -103,6 +131,22 @@ func (r DiscardReason) String() string {
 	default:
 		return "unknown"
 	}
+}
+
+// ingestURL builds the ingest endpoint with optional query parameters. base must
+// have no query string (the {endpoint}/ingest convention).
+func ingestURL(base, commit string, detailed bool) string {
+	var params []string
+	if commit != "" {
+		params = append(params, "commit="+commit)
+	}
+	if detailed {
+		params = append(params, "detailed_response=true")
+	}
+	if len(params) == 0 {
+		return base
+	}
+	return base + "?" + strings.Join(params, "&")
 }
 
 // permanentIngestStatus reports whether an HTTP status from the ingest endpoint
@@ -242,6 +286,7 @@ type Client struct {
 	autoReduceBatchSize bool
 	gzipEnabled         bool
 	detailedResponse    bool
+	commitMode          CommitMode
 	sendMu              sync.RWMutex // guards buffer sends against close(ingestBuffer) in Close
 	closed              bool         // set under sendMu write lock in Close
 }
@@ -329,6 +374,24 @@ func (c *Client) OnReject(f OnRejectFunc) {
 // off by default. Set before the first Ingest.
 func (c *Client) SetIngestDetailedResponse(enabled bool) {
 	c.detailedResponse = enabled
+}
+
+// SetIngestCommit selects the commit mode for batches that contain a
+// completion-tracked item (submitted via IngestSync / IngestBatch), so a
+// tracked Ack can mean "committed" rather than just "queued". The default,
+// CommitAuto, is unchanged behavior. Fire-and-forget-only batches always use
+// auto (no latency cost); a mixed batch uses the stronger mode if any tracked
+// item is present.
+//
+// CommitWaitFor / CommitForce make the ingest request block until commit, which
+// can take until the index's next commit. The timeouts must cover that: the
+// default transport's ResponseHeaderTimeout is getIngestTimeout()/3, so set
+// SetIngestTimeout to comfortably more than 3× the index commit interval (or
+// supply your own http.Client via SetHTTPClient). Otherwise the request times
+// out, retries, and may double-ingest — rely on a dedup id. Set before the first
+// Ingest.
+func (c *Client) SetIngestCommit(mode CommitMode) {
+	c.commitMode = mode
 }
 
 func (c *Client) httpClient() *http.Client {
@@ -554,6 +617,11 @@ func (c *Client) Ingest(data ...any) {
 // document id and dedup on it. Pass a ctx whose deadline sits comfortably inside
 // the subscription's ack-deadline; IngestSync never creates its own timeout.
 //
+// By default a nil result means the documents are persisted to the server's
+// ingest write-ahead log (crash-safe) but not necessarily searchable yet. Call
+// SetIngestCommit(CommitWaitFor) if Ack should mean committed and searchable, at
+// the cost of higher per-flush latency.
+//
 // Ack latency is bounded by the round-trip, not by maxDelay: because the items
 // are completion-tracked, the worker flushes them as soon as it goes idle rather
 // than waiting out the flush interval, while still coalescing bursts into batches.
@@ -731,12 +799,13 @@ func (c *Client) loop() {
 	// reset at the top of every flush so it only reflects the most recent attempt.
 	var retryAfter time.Duration
 
-	endpoint := c.endpoint
-	endpoint = strings.TrimSuffix(endpoint, "/")
-	endpoint = endpoint + "/ingest"
-	if c.detailedResponse {
-		endpoint = endpoint + "?detailed_response=true"
-	}
+	base := strings.TrimSuffix(c.endpoint, "/") + "/ingest"
+	// Two precomputed URLs: the default (commit=auto, used for fire-and-forget)
+	// and the tracked variant carrying the configured commit mode. They are equal
+	// when commitMode is CommitAuto, so the common path is unchanged.
+	endpointDefault := ingestURL(base, "", c.detailedResponse)
+	endpointTracked := ingestURL(base, c.commitMode.queryValue(), c.detailedResponse)
+	useTrackedCommit := endpointTracked != endpointDefault
 
 	flush := func(batch []ingestItem) bool {
 		if len(batch) == 0 {
@@ -752,7 +821,11 @@ func (c *Client) loop() {
 		// for the ack==nil encode failures — so no separate "encoded" slice is
 		// allocated per flush.
 		var encodeFailures []ingestItem
+		batchHasTracked := false
 		for _, it := range batch {
+			if it.ack != nil {
+				batchHasTracked = true
+			}
 			if it.raw != nil {
 				buf.Write(it.raw)
 				continue
@@ -762,6 +835,13 @@ func (c *Client) loop() {
 				encodeFailures = append(encodeFailures, it)
 				continue
 			}
+		}
+
+		// Use the configured commit mode only when this batch carries a tracked
+		// item; fire-and-forget batches keep commit=auto (no latency cost).
+		reqURL := endpointDefault
+		if useTrackedCommit && batchHasTracked {
+			reqURL = endpointTracked
 		}
 
 		// All items were unencodable — discard them and report success so the
@@ -796,7 +876,7 @@ func (c *Client) loop() {
 			ctx, cancel = context.WithTimeout(ctx, t)
 		}
 		defer cancel()
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(body))
 		if err != nil {
 			return false
 		}
@@ -880,7 +960,7 @@ func (c *Client) loop() {
 		// of falsely reporting them durable. A partial rejection cannot be
 		// attributed to specific documents in a coalesced batch — it is surfaced
 		// via OnReject inside inspectIngestResponse and the batch is still Acked.
-		if rejected, allRejected := c.inspectIngestResponse(respBody, endpoint); rejected && allRejected {
+		if rejected, allRejected := c.inspectIngestResponse(respBody, reqURL); rejected && allRejected {
 			err := &IngestError{
 				Reason: ReasonRejected,
 				Err:    fmt.Errorf("quickwit: server rejected all %d document(s) in the batch", len(batch)),
