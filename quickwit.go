@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -284,9 +286,55 @@ func (c *Client) newDefaultClient() *http.Client {
 		t.MaxIdleConns = concurrent
 	}
 
+	// Bound the time spent waiting for response headers to a fraction of the
+	// per-flush deadline. A server that completes TCP/TLS and reads the body but
+	// then stalls before responding (typical of an L4 load balancer fronting an
+	// overloaded indexer) frees the worker in ~1/3 of getIngestTimeout instead of
+	// tying it up for the full deadline. Firing returns a transport error, which
+	// is already retryable.
+	t.ResponseHeaderTimeout = c.getIngestTimeout() / 3
+
 	// No client-level timeout: the per-request context deadline from
 	// getIngestTimeout already bounds each flush, matching prior behavior.
 	return &http.Client{Transport: t}
+}
+
+// RetryAfterMax caps how long a Retry-After header can delay the next flush, so
+// a buggy or hostile value cannot stall ingestion indefinitely.
+const RetryAfterMax = 60 * time.Second
+
+// jitterBackoff returns a duration in [d/2, d] (equal jitter) so retries across
+// workers spread out instead of arriving in lockstep waves. The floor of d/2
+// keeps the fast path from collapsing to a near-zero sleep.
+func jitterBackoff(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	half := d / 2
+	return half + time.Duration(rand.Int64N(int64(half)+1))
+}
+
+// parseRetryAfter parses an HTTP Retry-After header, which is either a number of
+// seconds or an HTTP-date. now is passed in so the worker can use a single clock
+// read. It returns ok=false when the header is absent or unparseable.
+func parseRetryAfter(h string, now time.Time) (time.Duration, bool) {
+	h = strings.TrimSpace(h)
+	if h == "" {
+		return 0, false
+	}
+	if secs, err := strconv.Atoi(h); err == nil {
+		if secs <= 0 {
+			return 0, false
+		}
+		return time.Duration(secs) * time.Second, true
+	}
+	if t, err := http.ParseTime(h); err == nil {
+		if d := t.Sub(now); d > 0 {
+			return d, true
+		}
+		return 0, false
+	}
+	return 0, false
 }
 
 func (c *Client) getMaxDelay() time.Duration {
@@ -549,6 +597,11 @@ func (c *Client) loop() {
 	buffer := make([]ingestItem, 0, batchSize)
 	var resetBatchSizeAfter time.Time
 
+	// retryAfter carries a server-requested backpressure delay (from a 429/503
+	// Retry-After header) out of flush() and into retryFlush()'s sleep. It is
+	// reset at the top of every flush so it only reflects the most recent attempt.
+	var retryAfter time.Duration
+
 	endpoint := c.endpoint
 	endpoint = strings.TrimSuffix(endpoint, "/")
 	endpoint = endpoint + "/ingest"
@@ -558,6 +611,7 @@ func (c *Client) loop() {
 			return true
 		}
 
+		retryAfter = 0
 		buf.Reset()
 
 		// encodeFailures can only ever hold fire-and-forget items (ack == nil):
@@ -665,6 +719,14 @@ func (c *Client) loop() {
 				return true
 			}
 
+			// Backpressure: on 429/503, honor Retry-After (clamped) so we pace to
+			// the server instead of hammering it on the fixed backoff.
+			if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
+				if d, ok := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()); ok {
+					retryAfter = min(d, RetryAfterMax)
+				}
+			}
+
 			// Retryable (5xx, 408, 425, 429, transport errors handled above).
 			return false
 		}
@@ -738,7 +800,22 @@ func (c *Client) loop() {
 
 				attempt++
 				slog.Info("quickwit: flush failed, retrying indefinitely", "attempt", attempt)
-				time.Sleep(backoff)
+
+				// Equal-jittered backoff, raised to a server-requested Retry-After
+				// when present. The sleep is interruptible so Close (or a long
+				// Retry-After) cannot delay shutdown past the next close signal.
+				sleep := jitterBackoff(backoff)
+				if retryAfter > sleep {
+					sleep = retryAfter
+				}
+				timer := time.NewTimer(sleep)
+				select {
+				case <-timer.C:
+				case <-c.closeSignal:
+					timer.Stop()
+					goto closing
+				}
+
 				// Exponential backoff with a cap
 				backoff = time.Duration(float64(backoff) * 1.5)
 				if backoff > time.Second {
@@ -761,7 +838,9 @@ func (c *Client) loop() {
 			// Don't sleep on the last attempt
 			if i < maxRetries-1 {
 				slog.Info("quickwit: flush failed while closing, retrying", "attempt", i+1, "maxRetries", maxRetries)
-				time.Sleep(backoff)
+				// Jittered backoff; Retry-After is intentionally not honored here
+				// so a server-requested delay cannot stretch shutdown.
+				time.Sleep(jitterBackoff(backoff))
 				// Exponential backoff with a cap
 				backoff = time.Duration(float64(backoff) * 1.5)
 				if backoff > time.Second {
