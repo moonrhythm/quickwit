@@ -799,6 +799,12 @@ func (c *Client) loop() {
 	// reset at the top of every flush so it only reflects the most recent attempt.
 	var retryAfter time.Duration
 
+	// lastErr carries the reason the most recent flush failed out of flush() and
+	// into retryFlush()'s log line, so "flush failed, retrying indefinitely" says
+	// why (transport error, timeout, non-2xx status, …). Reset at the top of every
+	// flush like retryAfter, so it only reflects the most recent attempt.
+	var lastErr error
+
 	base := strings.TrimSuffix(c.endpoint, "/") + "/ingest"
 	// Two precomputed URLs: the default (commit=auto, used for fire-and-forget)
 	// and the tracked variant carrying the configured commit mode. They are equal
@@ -813,6 +819,7 @@ func (c *Client) loop() {
 		}
 
 		retryAfter = 0
+		lastErr = nil
 		buf.Reset()
 
 		// encodeFailures can only ever hold fire-and-forget items (ack == nil):
@@ -861,10 +868,12 @@ func (c *Client) loop() {
 			gzw.Reset(&gzBuf)
 			if _, err := gzw.Write(buf.Bytes()); err != nil {
 				slog.Error("quickwit: failed to gzip ingest body", "error", err)
+				lastErr = err
 				return false
 			}
 			if err := gzw.Close(); err != nil {
 				slog.Error("quickwit: failed to finalize gzip ingest body", "error", err)
+				lastErr = err
 				return false
 			}
 			body = gzBuf.Bytes()
@@ -878,6 +887,7 @@ func (c *Client) loop() {
 		defer cancel()
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(body))
 		if err != nil {
+			lastErr = err
 			return false
 		}
 		if useGzip {
@@ -887,6 +897,7 @@ func (c *Client) loop() {
 
 		resp, err := c.httpClient().Do(req)
 		if err != nil {
+			lastErr = fmt.Errorf("quickwit: ingest request failed: %w", err)
 			return false
 		}
 
@@ -895,6 +906,7 @@ func (c *Client) loop() {
 			resp.Body.Close()
 
 			slog.Error("quickwit: ingest status not ok", "status", resp.Status)
+			lastErr = fmt.Errorf("quickwit: ingest status %s", resp.Status)
 
 			if resp.StatusCode == http.StatusRequestEntityTooLarge {
 				if c.autoReduceBatchSize {
@@ -952,6 +964,7 @@ func (c *Client) loop() {
 		if readErr != nil {
 			// A truncated/incomplete 200 is ambiguous — retry rather than settle.
 			slog.Error("quickwit: failed to read ingest response", "error", readErr)
+			lastErr = fmt.Errorf("quickwit: failed to read ingest response: %w", readErr)
 			return false
 		}
 
@@ -1039,7 +1052,7 @@ func (c *Client) loop() {
 				}
 
 				attempt++
-				slog.Info("quickwit: flush failed, retrying indefinitely", "attempt", attempt)
+				slog.Info("quickwit: flush failed, retrying indefinitely", "attempt", attempt, "error", lastErr)
 
 				// Equal-jittered backoff, raised to a server-requested Retry-After
 				// when present. The sleep is interruptible so Close (or a long
@@ -1085,7 +1098,7 @@ func (c *Client) loop() {
 			}
 
 			attempt++
-			slog.Info("quickwit: flush failed while closing, retrying", "attempt", attempt)
+			slog.Info("quickwit: flush failed while closing, retrying", "attempt", attempt, "error", lastErr)
 			sleep := jitterBackoff(backoff)
 			if sleep > remaining {
 				sleep = remaining // never sleep past the deadline
